@@ -1,0 +1,20 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "FableKit",
+	"Description": "Editor automation bridge: exposes Blueprint graph authoring (nodes, pins, variables, functions, compile) to Python so an AI agent can author Blueprints via Remote Control HTTP.",
+	"Category": "Editor",
+	"CreatedBy": "Linesway",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"Installed": false,
+	"EnabledByDefault": true,
+	"Modules": [
+		{
+			"Name": "FableKit",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	]
+}
