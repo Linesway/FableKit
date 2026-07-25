@@ -18,6 +18,8 @@ public class FableKit : ModuleRules
 			"BlueprintGraph",
 			"AssetTools",
 			"AssetRegistry",
+			"UMG",
+			"UMGEditor",
 		});
 	}
 }

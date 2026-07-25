@@ -145,7 +145,9 @@ def add_component(bp_path, component_class, name, parent_name=None):
         new_class=component_class,
         blueprint_context=bp)
     handle, fail_reason = sds.add_new_subobject(params)
-    if not handle.is_valid():
+    # SubobjectDataHandle does not expose is_valid() to Python — probe via the data lookup instead.
+    data = sds.k2_find_subobject_data_from_handle(handle)
+    if data is None or unreal.SubobjectDataBlueprintFunctionLibrary.get_object(data) is None:
         raise RuntimeError("add_new_subobject failed: %s" % fail_reason)
     sds.rename_subobject(handle, unreal.Text(name))
     print("added component %s (%s)" % (name, component_class.get_name()))
@@ -153,6 +155,42 @@ def add_component(bp_path, component_class, name, parent_name=None):
 
 
 # ---------------------------------------------------------------- blueprint lifecycle
+
+def create_widget_bp(package_path, name, parent="/Script/UMG.UserWidget"):
+    """Create a real UWidgetBlueprint (designer-capable) — the generic factory can't."""
+    return j(unreal.FableBP.create_widget_blueprint(package_path, name, parent))
+
+
+def wt_list(bp_path):
+    return j(unreal.FableBP.wt_list_widgets(_norm(bp_path)))
+
+
+def wt_add(bp_path, widget_class, name, parent_name=""):
+    """Add a widget to the tree. Empty parent_name = root. Panels AddChild; Border/SizeBox SetContent."""
+    return j(unreal.FableBP.wt_add_widget(_norm(bp_path), widget_class, name, parent_name))
+
+
+def wt_remove(bp_path, name):
+    return j(unreal.FableBP.wt_remove_widget(_norm(bp_path), name))
+
+
+def wt_set(bp_path, name, **props):
+    """Set widget properties. Values are UE ImportText strings — T3D struct literals work verbatim."""
+    import json as _json
+    return j(unreal.FableBP.wt_set_props(_norm(bp_path), name, _json.dumps(props)))
+
+
+def wt_slot(bp_path, name, **props):
+    """Set layout-slot properties (Padding/HorizontalAlignment/Size...)."""
+    import json as _json
+    return j(unreal.FableBP.wt_set_slot_props(_norm(bp_path), name, _json.dumps(props)))
+
+
+def clear_dead_bindings(bp_path):
+    """Widget BPs: drop orphaned FDelegateEditorBinding entries (deleted binding functions). The
+    Bindings array is python-protected, so this rides the native FableBP.ClearDeadBindings."""
+    return j(unreal.FableBP.clear_dead_bindings(_norm(bp_path)))
+
 
 def compile_bp(bp_path):
     res = json.loads(BP.compile_bp(bp_path))

@@ -159,6 +159,42 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "FableKit")
 	static FString BreakAllPinLinks(const FString& BlueprintPath, const FString& GraphName, const FString& NodeId, const FString& PinName);
 
+	/** Widget Blueprints only: remove FDelegateEditorBinding entries whose bound function/property no
+	    longer exists (orphaned property bindings — the UMG compiler hard-errors on them and python can't
+	    reach the protected Bindings array). Returns {ok, removed, kept}. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit")
+	static FString ClearDeadBindings(const FString& BlueprintPath);
+
+	/* ---- Widget-tree authoring (UMG designer surface — v1 excluded it; these close the gap) ---- */
+
+	/** Create a WidgetBlueprint asset (the generic Blueprint factory makes a non-designer Blueprint for
+	    UUserWidget parents — this uses the real UWidgetBlueprintFactory). Parent: '/Script/M.Class' or a
+	    '/Game/...' widget BP. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit")
+	static FString CreateWidgetBlueprint(const FString& PackagePath, const FString& AssetName, const FString& ParentClassPath);
+
+	/** Tree dump: every widget's name/class/parent/slot class. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit")
+	static FString WtListWidgets(const FString& BlueprintPath);
+
+	/** Construct a widget in the tree. Empty ParentName: becomes the root if none exists, else errors.
+	    Parents that are panels AddChild; single-content widgets (Border/SizeBox/Button…) SetContent. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit")
+	static FString WtAddWidget(const FString& BlueprintPath, const FString& WidgetClassPath, const FString& WidgetName, const FString& ParentName);
+
+	/** Remove a widget (and its subtree) from the tree by name. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit")
+	static FString WtRemoveWidget(const FString& BlueprintPath, const FString& WidgetName);
+
+	/** Set properties on a tree widget from JSON {"Prop": "UE text value", ...}. Values go through
+	    FProperty::ImportText, so struct literals in T3D syntax work verbatim (brushes, fonts, styles). */
+	UFUNCTION(BlueprintCallable, Category = "FableKit")
+	static FString WtSetProps(const FString& BlueprintPath, const FString& WidgetName, const FString& PropsJson);
+
+	/** Same, on the widget's layout SLOT (padding/alignment/size rules). */
+	UFUNCTION(BlueprintCallable, Category = "FableKit")
+	static FString WtSetSlotProps(const FString& BlueprintPath, const FString& WidgetName, const FString& PropsJson);
+
 	/** Set a pin literal. Object/class pins take an object path; text pins set localized text; others take the literal string. */
 	UFUNCTION(BlueprintCallable, Category = "FableKit")
 	static FString SetPinDefault(const FString& BlueprintPath, const FString& GraphName, const FString& NodeId, const FString& PinName, const FString& Value);

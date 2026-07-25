@@ -99,6 +99,11 @@ adds helpers: `create_bp`, `add_component`, `list_components`, `get_cdo`/`set_cd
   `remove_variable`, `set_variable_flags`, `add_function`, `add_function_override`,
   `add_local_variable`, `add_event_dispatcher`, `add_interface`,
   `remove_graph_by_name`
+- widget trees (UMG designer surface): `create_widget_blueprint` (real UWidgetBlueprintFactory),
+  `wt_list_widgets`, `wt_add_widget` (panels AddChild, Border/SizeBox SetContent),
+  `wt_remove_widget`, `wt_set_props` / `wt_set_slot_props` (values go through FProperty::ImportText,
+  so T3D-syntax struct literals — brushes, fonts, whole WidgetStyles — apply verbatim),
+  `clear_dead_bindings` (orphaned FDelegateEditorBindings; the Bindings array is python-protected)
 - lifecycle: `compile_bp` (returns compiler errors/warnings), `fixup_redirectors`
 
 Conventions: JSON in/out everywhere; failed lookups return the valid options
@@ -116,7 +121,8 @@ transform linearcolor byte wildcard`, `object:/Script/Engine.Actor`, `class:...`
 
 - The editor must be running (headless alternative:
   `UnrealEditor-Cmd.exe <Project>.uproject -run=pythonscript -script=job.py`).
-- Out of scope v1: timelines, AnimBP graphs, material graphs, UMG widget trees.
+- Out of scope v1: timelines, AnimBP graphs, material graphs. (UMG widget trees gained a dedicated
+  `wt_*` surface — animations and designer-only niceties still need the editor.)
   Enhanced-input event nodes: `add_node_by_class`
   `/Script/BlueprintGraph.K2Node_EnhancedInputAction`, then set `input_action` via
   `unreal.find_object(<node path>)` + `reconstruct_node`.

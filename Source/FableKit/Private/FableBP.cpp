@@ -42,6 +42,16 @@
 #include "K2Node_CallDelegate.h"
 #include "K2Node_AddDelegate.h"
 
+#include "WidgetBlueprint.h"
+#include "WidgetBlueprintFactory.h"
+#include "Blueprint/UserWidget.h"
+#include "Blueprint/WidgetTree.h"
+#include "Modules/ModuleManager.h"
+#include "Components/Widget.h"
+#include "Components/PanelWidget.h"
+#include "Components/ContentWidget.h"
+#include "Components/PanelSlot.h"
+
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "Kismet2/CompilerResultsLog.h"
@@ -529,6 +539,13 @@ static FJObj NodeToJson(UEdGraphNode* Node, bool bIncludePins)
 	O->SetStringField(TEXT("title"), Node->GetNodeTitle(ENodeTitleType::ListView).ToString());
 	O->SetNumberField(TEXT("x"), Node->NodePosX);
 	O->SetNumberField(TEXT("y"), Node->NodePosY);
+	// Comment boxes: size + text, so callers can compute containment (EdGraphNode_Comment isn't
+	// script-exposed, making this the only python-reachable source for either).
+	if (Node->IsA<UEdGraphNode_Comment>())
+	{
+		O->SetNumberField(TEXT("width"), Node->NodeWidth);
+		O->SetNumberField(TEXT("height"), Node->NodeHeight);
+	}
 	O->SetStringField(TEXT("path"), Node->GetPathName());
 	if (!Node->IsNodeEnabled()) { O->SetBoolField(TEXT("disabled"), true); }
 	if (!Node->NodeComment.IsEmpty()) { O->SetStringField(TEXT("comment"), Node->NodeComment); }
@@ -1515,6 +1532,295 @@ FString UFableBP::BreakAllPinLinks(const FString& BlueprintPath, const FString& 
 	return ToJson(O);
 }
 
+FString UFableBP::ClearDeadBindings(const FString& BlueprintPath)
+{
+	FString E;
+	UBlueprint* BP = LoadBP(BlueprintPath, E);
+	if (!BP) { return Err(E); }
+	UWidgetBlueprint* WBP = Cast<UWidgetBlueprint>(BP);
+	if (!WBP) { return Err(FString::Printf(TEXT("Not a WidgetBlueprint: %s"), *BlueprintPath)); }
+	if (!CheckMutate(E)) { return Err(E); }
+
+	// Deliberately NOT consulting GeneratedClass — it still carries functions/properties from the last
+	// successful compile, so a binding whose function GRAPH was deleted looks "alive" through it
+	// (observed: removed:0 on a binding the UMG compiler then hard-errored on). Truth = current
+	// authoring state (function graphs + BP variables) plus never-stale NATIVE parents.
+	UClass* NativeParent = WBP->ParentClass;
+	while (NativeParent && !NativeParent->HasAnyClassFlags(CLASS_Native))
+	{
+		NativeParent = NativeParent->GetSuperClass();
+	}
+
+	auto BindingIsAlive = [&](const FDelegateEditorBinding& Binding) -> bool
+	{
+		if (!Binding.FunctionName.IsNone())
+		{
+			for (UEdGraph* G : WBP->FunctionGraphs)
+			{
+				if (G && G->GetFName() == Binding.FunctionName) { return true; }
+			}
+			return NativeParent && NativeParent->FindFunctionByName(Binding.FunctionName) != nullptr;
+		}
+		if (!Binding.SourceProperty.IsNone())
+		{
+			for (const FBPVariableDescription& Var : WBP->NewVariables)
+			{
+				if (Var.VarName == Binding.SourceProperty) { return true; }
+			}
+			return NativeParent && NativeParent->FindPropertyByName(Binding.SourceProperty) != nullptr;
+		}
+		if (!Binding.SourcePath.IsEmpty()) { return true; }  // path-style bindings resolve elsewhere
+		return false;                                        // nothing to call = dead entry
+	};
+
+	const FScopedTransaction Txn(FText::FromString(TEXT("FableKit: Clear Dead Bindings")));
+	WBP->Modify();
+	int32 Removed = 0;
+	for (int32 i = WBP->Bindings.Num() - 1; i >= 0; --i)
+	{
+		if (!BindingIsAlive(WBP->Bindings[i]))
+		{
+			WBP->Bindings.RemoveAt(i);
+			++Removed;
+		}
+	}
+	if (Removed > 0) { FBlueprintEditorUtils::MarkBlueprintAsModified(WBP); }
+
+	FJObj O = NewObj();
+	O->SetBoolField(TEXT("ok"), true);
+	O->SetNumberField(TEXT("removed"), Removed);
+	O->SetNumberField(TEXT("kept"), WBP->Bindings.Num());
+	return ToJson(O);
+}
+
+/* ---- Widget-tree authoring ---- */
+
+static UWidgetBlueprint* LoadWBP(const FString& Path, FString& OutErr)
+{
+	UBlueprint* BP = LoadBP(Path, OutErr);
+	if (!BP) { return nullptr; }
+	UWidgetBlueprint* WBP = Cast<UWidgetBlueprint>(BP);
+	if (!WBP) { OutErr = FString::Printf(TEXT("Not a WidgetBlueprint: %s"), *Path); }
+	return WBP;
+}
+
+static UWidget* FindTreeWidget(UWidgetBlueprint* WBP, const FString& Name, FString& OutErr)
+{
+	UWidget* W = WBP->WidgetTree ? WBP->WidgetTree->FindWidget(FName(*Name)) : nullptr;
+	if (!W)
+	{
+		TArray<FString> Names;
+		if (WBP->WidgetTree)
+		{
+			WBP->WidgetTree->ForEachWidget([&Names](UWidget* Each) { if (Each) { Names.Add(Each->GetName()); } });
+		}
+		OutErr = ErrWithList(FString::Printf(TEXT("No tree widget named '%s'"), *Name), TEXT("widgets"), Names);
+	}
+	return W;
+}
+
+FString UFableBP::CreateWidgetBlueprint(const FString& PackagePath, const FString& AssetName, const FString& ParentClassPath)
+{
+	FString E;
+	if (!CheckMutate(E)) { return Err(E); }
+
+	UClass* Parent = UUserWidget::StaticClass();
+	if (!ParentClassPath.IsEmpty())
+	{
+		Parent = ResolveClass(ParentClassPath, E);
+		if (!Parent) { return Err(E); }
+		if (!Parent->IsChildOf(UUserWidget::StaticClass()))
+		{
+			return Err(FString::Printf(TEXT("Parent is not a UUserWidget: %s"), *ParentClassPath));
+		}
+	}
+
+	UWidgetBlueprintFactory* Factory = NewObject<UWidgetBlueprintFactory>();
+	Factory->ParentClass = Parent;
+	IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools").Get();
+	UObject* Asset = AssetTools.CreateAsset(AssetName, PackagePath, UWidgetBlueprint::StaticClass(), Factory);
+	if (!Asset) { return Err(TEXT("CreateAsset failed (does the asset already exist?)")); }
+
+	FJObj O = NewObj();
+	O->SetBoolField(TEXT("ok"), true);
+	O->SetStringField(TEXT("path"), Asset->GetPathName());
+	return ToJson(O);
+}
+
+FString UFableBP::WtListWidgets(const FString& BlueprintPath)
+{
+	FString E;
+	UWidgetBlueprint* WBP = LoadWBP(BlueprintPath, E);
+	if (!WBP) { return Err(E); }
+
+	TArray<FJVal> Rows;
+	if (WBP->WidgetTree)
+	{
+		WBP->WidgetTree->ForEachWidget([&Rows](UWidget* W)
+		{
+			if (!W) { return; }
+			FJObj Row = NewObj();
+			Row->SetStringField(TEXT("name"), W->GetName());
+			Row->SetStringField(TEXT("class"), W->GetClass()->GetName());
+			Row->SetStringField(TEXT("parent"), W->GetParent() ? W->GetParent()->GetName() : TEXT(""));
+			Row->SetStringField(TEXT("slot"), W->Slot ? W->Slot->GetClass()->GetName() : TEXT(""));
+			Rows.Add(MakeShared<FJsonValueObject>(Row));
+		});
+	}
+	FJObj O = NewObj();
+	O->SetBoolField(TEXT("ok"), true);
+	O->SetStringField(TEXT("root"), (WBP->WidgetTree && WBP->WidgetTree->RootWidget) ? WBP->WidgetTree->RootWidget->GetName() : TEXT(""));
+	O->SetArrayField(TEXT("widgets"), Rows);
+	return ToJson(O);
+}
+
+FString UFableBP::WtAddWidget(const FString& BlueprintPath, const FString& WidgetClassPath, const FString& WidgetName, const FString& ParentName)
+{
+	FString E;
+	UWidgetBlueprint* WBP = LoadWBP(BlueprintPath, E);
+	if (!WBP) { return Err(E); }
+	if (!CheckMutate(E)) { return Err(E); }
+	if (!WBP->WidgetTree) { return Err(TEXT("Widget has no WidgetTree")); }
+
+	UClass* WidgetClass = ResolveClass(WidgetClassPath, E);
+	if (!WidgetClass) { return Err(E); }
+	if (!WidgetClass->IsChildOf(UWidget::StaticClass()))
+	{
+		return Err(FString::Printf(TEXT("Not a UWidget class: %s"), *WidgetClassPath));
+	}
+	if (WBP->WidgetTree->FindWidget(FName(*WidgetName)))
+	{
+		return Err(FString::Printf(TEXT("A tree widget named '%s' already exists"), *WidgetName));
+	}
+
+	const FScopedTransaction Txn(FText::FromString(TEXT("FableKit: Add Tree Widget")));
+	WBP->WidgetTree->Modify();
+
+	UWidget* NewWidgetObj = WBP->WidgetTree->ConstructWidget<UWidget>(WidgetClass, FName(*WidgetName));
+	if (!NewWidgetObj) { return Err(TEXT("ConstructWidget failed")); }
+
+	if (ParentName.IsEmpty())
+	{
+		if (WBP->WidgetTree->RootWidget)
+		{
+			return Err(TEXT("Tree already has a root — pass ParentName"));
+		}
+		WBP->WidgetTree->RootWidget = NewWidgetObj;
+	}
+	else
+	{
+		UWidget* Parent = FindTreeWidget(WBP, ParentName, E);
+		if (!Parent) { return E; }
+		if (UPanelWidget* Panel = Cast<UPanelWidget>(Parent))
+		{
+			Panel->Modify();
+			Panel->AddChild(NewWidgetObj);
+		}
+		else if (UContentWidget* Content = Cast<UContentWidget>(Parent))
+		{
+			Content->Modify();
+			Content->SetContent(NewWidgetObj);
+		}
+		else
+		{
+			return Err(FString::Printf(TEXT("Parent '%s' (%s) cannot hold children"), *ParentName, *Parent->GetClass()->GetName()));
+		}
+	}
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WBP);
+
+	FJObj O = NewObj();
+	O->SetBoolField(TEXT("ok"), true);
+	O->SetStringField(TEXT("name"), NewWidgetObj->GetName());
+	O->SetStringField(TEXT("class"), WidgetClass->GetName());
+	O->SetStringField(TEXT("slot"), NewWidgetObj->Slot ? NewWidgetObj->Slot->GetClass()->GetName() : TEXT(""));
+	return ToJson(O);
+}
+
+FString UFableBP::WtRemoveWidget(const FString& BlueprintPath, const FString& WidgetName)
+{
+	FString E;
+	UWidgetBlueprint* WBP = LoadWBP(BlueprintPath, E);
+	if (!WBP) { return Err(E); }
+	if (!CheckMutate(E)) { return Err(E); }
+	UWidget* W = FindTreeWidget(WBP, WidgetName, E);
+	if (!W) { return E; }
+
+	const FScopedTransaction Txn(FText::FromString(TEXT("FableKit: Remove Tree Widget")));
+	WBP->WidgetTree->Modify();
+	if (WBP->WidgetTree->RootWidget == W)
+	{
+		WBP->WidgetTree->RootWidget = nullptr;
+	}
+	else if (UPanelWidget* Parent = W->GetParent())
+	{
+		Parent->Modify();
+		Parent->RemoveChild(W);
+	}
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WBP);
+
+	FJObj O = NewObj();
+	O->SetBoolField(TEXT("ok"), true);
+	return ToJson(O);
+}
+
+static FString SetPropsOnObject(UWidgetBlueprint* WBP, UObject* Target, const FString& PropsJson)
+{
+	TSharedPtr<FJsonObject> Props;
+	if (!FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(PropsJson), Props) || !Props.IsValid())
+	{
+		return Err(TEXT("PropsJson is not a JSON object"));
+	}
+
+	const FScopedTransaction Txn(FText::FromString(TEXT("FableKit: Set Widget Props")));
+	Target->Modify();
+
+	TArray<FString> Set, Failed;
+	for (const auto& Pair : Props->Values)
+	{
+		FString ValueText;
+		if (Pair.Value->Type == EJson::String) { ValueText = Pair.Value->AsString(); }
+		else if (Pair.Value->Type == EJson::Boolean) { ValueText = Pair.Value->AsBool() ? TEXT("True") : TEXT("False"); }
+		else if (Pair.Value->Type == EJson::Number) { ValueText = LexToString(Pair.Value->AsNumber()); }
+		else { Failed.Add(Pair.Key + TEXT(" (unsupported JSON type)")); continue; }
+
+		FProperty* Prop = Target->GetClass()->FindPropertyByName(FName(*Pair.Key));
+		if (!Prop) { Failed.Add(Pair.Key + TEXT(" (no such property)")); continue; }
+		// T3D-syntax struct literals (brushes, styles, fonts) import verbatim here.
+		const TCHAR* Result = Prop->ImportText_InContainer(*ValueText, Target, Target, PPF_None);
+		if (Result) { Set.Add(Pair.Key); } else { Failed.Add(Pair.Key + TEXT(" (ImportText rejected the value)")); }
+	}
+	FBlueprintEditorUtils::MarkBlueprintAsModified(WBP);
+
+	FJObj O = NewObj();
+	O->SetBoolField(TEXT("ok"), Failed.Num() == 0);
+	SetStrArray(O, TEXT("set"), Set);
+	SetStrArray(O, TEXT("failed"), Failed);
+	return ToJson(O);
+}
+
+FString UFableBP::WtSetProps(const FString& BlueprintPath, const FString& WidgetName, const FString& PropsJson)
+{
+	FString E;
+	UWidgetBlueprint* WBP = LoadWBP(BlueprintPath, E);
+	if (!WBP) { return Err(E); }
+	if (!CheckMutate(E)) { return Err(E); }
+	UWidget* W = FindTreeWidget(WBP, WidgetName, E);
+	if (!W) { return E; }
+	return SetPropsOnObject(WBP, W, PropsJson);
+}
+
+FString UFableBP::WtSetSlotProps(const FString& BlueprintPath, const FString& WidgetName, const FString& PropsJson)
+{
+	FString E;
+	UWidgetBlueprint* WBP = LoadWBP(BlueprintPath, E);
+	if (!WBP) { return Err(E); }
+	if (!CheckMutate(E)) { return Err(E); }
+	UWidget* W = FindTreeWidget(WBP, WidgetName, E);
+	if (!W) { return E; }
+	if (!W->Slot) { return Err(FString::Printf(TEXT("'%s' has no layout slot (is it the root?)"), *WidgetName)); }
+	return SetPropsOnObject(WBP, W->Slot, PropsJson);
+}
+
 FString UFableBP::SetPinDefault(const FString& BlueprintPath, const FString& GraphName, const FString& NodeId, const FString& PinName, const FString& Value)
 {
 	FGraphCtx Ctx = GetGraphCtx(BlueprintPath, GraphName, true);
@@ -1892,7 +2198,11 @@ FString UFableBP::CompileBP(const FString& BlueprintPath)
 	if (!BP) { return Err(E); }
 
 	FCompilerResultsLog Results;
-	FKismetEditorUtilities::CompileBlueprint(BP, EBlueprintCompileOptions::None, &Results);
+	// SkipSave: the compile manager's save-on-compile path regenerates asset THUMBNAILS,
+	// which spawns preview actors in a transient world — stale cached preview actors from a
+	// pre-reparent class fatally collide with renamed native components (Cascade vs Niagara
+	// 'Trail'). Callers save explicitly via EditorAssetLibrary instead.
+	FKismetEditorUtilities::CompileBlueprint(BP, EBlueprintCompileOptions::SkipSave, &Results);
 
 	TArray<FString> Errors, Warnings;
 	for (const TSharedRef<FTokenizedMessage>& Msg : Results.Messages)

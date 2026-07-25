@@ -33,13 +33,93 @@ PYLIB_CDO = "/Script/PythonScriptPlugin.Default__PythonScriptLibrary"
 PLUGIN_PY = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Content", "Python"))
 
 
+def ws_call(host, port, payload, timeout):
+    """Remote Control WebSocket fallback (default port 30020). Same object/call
+    semantics as the HTTP route; used when the HTTP listener lost its bind race
+    (e.g. a previous editor instance still held 30010 during startup)."""
+    import base64
+    import os
+    import socket
+    import struct
+
+    s = socket.create_connection((host, port), timeout=min(timeout, 30))
+    s.settimeout(timeout)
+    key = base64.b64encode(os.urandom(16)).decode()
+    s.sendall(("GET / HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\n"
+               "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+               "Sec-WebSocket-Version: 13\r\n\r\n" % (host, port, key)).encode())
+    hdr = b""
+    while b"\r\n\r\n" not in hdr:
+        chunk = s.recv(4096)
+        if not chunk:
+            raise ConnectionError("websocket handshake closed")
+        hdr += chunk
+    if b" 101 " not in hdr.split(b"\r\n", 1)[0]:
+        raise ConnectionError("websocket handshake refused: %s" % hdr[:120])
+
+    msg = json.dumps({"MessageName": "http", "Id": 1, "Parameters": {
+        "Url": "/remote/object/call", "Verb": "PUT", "Body": payload}}).encode()
+    mask = os.urandom(4)
+    ln = len(msg)
+    if ln < 126:
+        frame = struct.pack("!BB", 0x81, 0x80 | ln)
+    elif ln < 65536:
+        frame = struct.pack("!BBH", 0x81, 0x80 | 126, ln)
+    else:
+        frame = struct.pack("!BBQ", 0x81, 0x80 | 127, ln)
+    frame += mask + bytes(b ^ mask[i % 4] for i, b in enumerate(msg))
+    s.sendall(frame)
+
+    def recv_exact(n):
+        buf = b""
+        while len(buf) < n:
+            c = s.recv(n - len(buf))
+            if not c:
+                raise ConnectionError("websocket closed mid-frame")
+            buf += c
+        return buf
+
+    data = b""
+    while True:
+        b1, b2 = recv_exact(2)
+        opcode = b1 & 0x0F
+        ln = b2 & 0x7F
+        if ln == 126:
+            ln = struct.unpack("!H", recv_exact(2))[0]
+        elif ln == 127:
+            ln = struct.unpack("!Q", recv_exact(8))[0]
+        pl = recv_exact(ln) if ln else b""
+        if opcode == 0x9:  # ping -> pong
+            s.sendall(struct.pack("!BB", 0x8A, 0x80) + os.urandom(4))
+            continue
+        if opcode in (0x1, 0x0):
+            data += pl
+            if b1 & 0x80:
+                break
+        elif opcode == 0x8:
+            raise ConnectionError("websocket closed by server")
+    s.close()
+    resp = json.loads(data.decode("utf-8", errors="replace"))
+    body = resp.get("ResponseBody", resp)
+    if isinstance(body, str):
+        body = json.loads(body)
+    return body
+
+
 def call_remote(host, port, payload, timeout):
     url = "http://%s:%d/remote/object/call" % (host, port)
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="PUT",
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8", errors="replace"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError:
+        raise  # real HTTP response (4xx/5xx) — not a transport failure
+    except (urllib.error.URLError, ConnectionError, OSError):
+        # HTTP transport broken (refused/reset/half-bound listener) ->
+        # try the RC WebSocket (port+10 by default)
+        return ws_call(host, port + 10, payload, timeout)
 
 
 def run_python(host, port, code, timeout):
