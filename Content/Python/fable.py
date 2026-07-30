@@ -7,6 +7,14 @@ plus the stock unreal.* APIs for everything Python can already do natively:
 assets, components, CDO defaults, reparenting, levels.
 
 Everything here is driven from outside via Tools/fable/uexec.py.
+
+SEE A WIDGET INSTEAD OF GUESSING (the one-liner worth remembering):
+
+    python Plugins/FableKit/Tools/uexec.py -c "import fable; fable.render_widget('/Game/UI/WBP_Thing', r'C:/tmp/thing.png', 1920, 1080)"
+
+then open/Read C:/tmp/thing.png. Renders the Widget Blueprint offscreen — no editor window, no PIE.
+Live game state does NOT appear (the widget is built design-time, so NativeConstruct never runs); you
+are reviewing layout, spacing, alignment and colour. See render_widget() and UFableRender's C++ header.
 """
 import json
 import unreal
@@ -156,6 +164,73 @@ def add_component(bp_path, component_class, name, parent_name=None):
 
 # ---------------------------------------------------------------- blueprint lifecycle
 
+# ---------------------------------------------------------------- Niagara
+# Compose-and-configure, not module-stack editing: assemble effects from emitters that already look
+# right, then retune them. See UFableNiagara's header for why the module stack is out of scope.
+
+def fx_info(system_path):
+    """Emitters (name/enabled/renderers) + exposed User parameters."""
+    return j(unreal.FableNiagara.info(_norm(system_path)))
+
+
+def fx_params(system_path):
+    """Exposed User.* parameters with their current values."""
+    return j(unreal.FableNiagara.list_user_params(_norm(system_path)))
+
+
+def fx_dump_renderer(system_path, emitter, index=0):
+    """Every property on one renderer — the discovery step before fx_set_renderer."""
+    return j(unreal.FableNiagara.dump_renderer(_norm(system_path), emitter, index))
+
+
+def fx_set(system_path, param, value):
+    """Set an exposed User parameter. Bare scalars are fine ('2.5'); structs take UE text
+    ('(R=1,G=0,B=0,A=1)'). The 'User.' prefix is optional."""
+    return j(unreal.FableNiagara.set_user_param(_norm(system_path), param, str(value)))
+
+
+def fx_set_renderer(system_path, emitter, index=0, **props):
+    """Set renderer properties (Material, Meshes, SubImageSize...) by UE text, like wt_set."""
+    import json as _json
+    return j(unreal.FableNiagara.set_renderer_props(_norm(system_path), emitter, index, _json.dumps(props)))
+
+
+def fx_enable_emitter(system_path, emitter, enabled=True):
+    return j(unreal.FableNiagara.set_emitter_enabled(_norm(system_path), emitter, enabled))
+
+
+def fx_create(package_path, name):
+    """New empty NiagaraSystem asset."""
+    return j(unreal.FableNiagara.create_system(package_path, name))
+
+
+def fx_add_emitter(system_path, source_path, source_emitter="", new_name=""):
+    """COPY an emitter into a system. source_path is a NiagaraEmitter asset, or a NiagaraSystem
+    (then source_emitter picks which one). The donor is never modified. This is the authoring verb."""
+    return j(unreal.FableNiagara.add_emitter(_norm(system_path), _norm(source_path), source_emitter, new_name))
+
+
+def fx_remove_emitter(system_path, emitter):
+    return j(unreal.FableNiagara.remove_emitter(_norm(system_path), emitter))
+
+
+def fx_duplicate(system_path, dest_package, dest_name):
+    """Duplicate a whole system — the safe way to iterate on a shipped effect."""
+    return j(unreal.FableNiagara.duplicate_system(_norm(system_path), dest_package, dest_name))
+
+
+def fx_compile(system_path):
+    """Request a compile. `ready` will be FALSE in this same call — Niagara queues compile work onto the
+    editor tick, and a bridge call holds the game thread so no tick can happen inside it. Check
+    fx_ready() in a LATER call (a separate uexec invocation) before saving. Not a failure."""
+    return j(unreal.FableNiagara.compile_system(_norm(system_path)))
+
+
+def fx_ready(system_path):
+    """Read-only readiness probe — poll this after fx_compile, in a separate call."""
+    return j(unreal.FableNiagara.is_ready(_norm(system_path)))
+
+
 def create_widget_bp(package_path, name, parent="/Script/UMG.UserWidget"):
     """Create a real UWidgetBlueprint (designer-capable) — the generic factory can't."""
     return j(unreal.FableBP.create_widget_blueprint(package_path, name, parent))
@@ -184,6 +259,77 @@ def wt_slot(bp_path, name, **props):
     """Set layout-slot properties (Padding/HorizontalAlignment/Size...)."""
     import json as _json
     return j(unreal.FableBP.wt_set_slot_props(_norm(bp_path), name, _json.dumps(props)))
+
+
+# ---------------------------------------------------------------- offscreen render
+
+def render_widget(bp_path, out_png, width=0, height=0,
+                  background=None, scale=None, pre_construct=None):
+    """Render a Widget Blueprint offscreen to a PNG. Returns the reply dict; raises on failure.
+
+        fable.render_widget('/Game/UI/WBP_Thing', r'C:/tmp/thing.png', 1920, 1080)
+
+    width/height 0 auto-sizes (designer canvas size, then the measured desired size). Pass explicit
+    numbers for anything with a root Canvas Panel — those measure 0x0 and auto-size will refuse.
+
+    background     'transparent'|'black'|'white'|'dark'|'light'|'grey', '#RRGGBB[AA]', linear
+                   'R,G,B[,A]', or '(R=..,G=..,B=..,A=..)'. Default 'dark'. This is what a
+                   transparent panel gets composited over, so flip it to 'light' to check contrast.
+    scale          DPI / layout scale, 0..8 (default 1.0). The image stays width x height; the widget
+                   lays out as if the application DPI scale were this.
+    pre_construct  False skips NativePreConstruct. The escape hatch: PreConstruct is the only widget
+                   code that runs here, so it is the only thing that can still crash on null state.
+
+    WHAT YOU SEE: layout and styling only. The widget is constructed design-time (same as the editor's
+    own asset thumbnails), so NativeConstruct and NativeOnInitialized never run and anything driven
+    from a PlayerController / PlayerState / inventory shows its design-time default instead.
+    """
+    import json as _json
+    opts = {}
+    if background is not None:
+        opts["background"] = str(background)
+    if scale is not None:
+        opts["scale"] = float(scale)
+    if pre_construct is not None:
+        opts["pre_construct"] = bool(pre_construct)
+    res = j(unreal.FableRender.render_widget(
+        _norm(bp_path), out_png, int(width), int(height),
+        _json.dumps(opts) if opts else ""))
+    print("rendered %s -> %s (%dx%d)" % (bp_path, res["png"], res["width"], res["height"]))
+    return res
+
+
+def render_mesh(mesh_path, out_png, width=1024, height=1024, yaw=None, pitch=None, roll=None,
+                distance=None, fov=None, material=None, light_yaw=None, light_pitch=None,
+                exposure=None):
+    """Render a StaticMesh offscreen to a PNG from any camera angle. Returns the reply dict.
+
+        fable.render_mesh('/Game/Effects/SwordSlash/SM_SlashArc', r'C:/tmp/arc.png',
+                          yaw=35, pitch=-20)
+
+    Runs in a throwaway preview world, so the level you have open is never spawned into or dirtied.
+
+    yaw/pitch/roll  camera orbit in degrees. yaw 0 looks down +X; negative pitch looks DOWN.
+    distance        uu from the bounds centre; None/0 auto-frames the bounding sphere.
+    material        override every material slot. Render TWICE — once as authored to judge the
+                    EFFECT, once with '/Engine/EngineMaterials/DefaultMaterial' to judge the
+                    GEOMETRY. An unlit additive material hides curvature that a lit grey pass shows.
+    exposure        fixed EV bias (default 1.0). Raise it to tame a blown-out emissive.
+    """
+    import json as _json
+    opts = {}
+    for key, val in (("yaw", yaw), ("pitch", pitch), ("roll", roll), ("distance", distance),
+                     ("fov", fov), ("light_yaw", light_yaw), ("light_pitch", light_pitch),
+                     ("exposure", exposure)):
+        if val is not None:
+            opts[key] = float(val)
+    if material is not None:
+        opts["material"] = _norm(material)
+    res = j(unreal.FableRender.render_mesh(
+        _norm(mesh_path), out_png, int(width), int(height),
+        _json.dumps(opts) if opts else ""))
+    print("rendered %s -> %s (%dx%d)" % (mesh_path, res["png"], res["width"], res["height"]))
+    return res
 
 
 def clear_dead_bindings(bp_path):

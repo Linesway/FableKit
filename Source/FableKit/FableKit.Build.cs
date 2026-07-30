@@ -20,6 +20,15 @@ public class FableKit : ModuleRules
 			"AssetRegistry",
 			"UMG",
 			"UMGEditor",
+			// Offscreen widget rendering (UFableRender): FWidgetRenderer itself lives in UMG (above), but
+			// the draw + readback needs FlushRenderingCommands and BeginCleanup, which are RenderCore.
+			// Both arrive transitively through Engine today — declared explicitly so a future engine
+			// header shuffle can't quietly break this module. (No RHI needed: EPixelFormat is in Core.)
+			"RenderCore",
+			// Niagara authoring (UFableNiagara): runtime module for the asset types, editor module for
+			// AddEmitterToSystem / KillSystemInstances / the system factory.
+			"Niagara",
+			"NiagaraEditor",
 		});
 	}
 }

@@ -106,6 +106,43 @@ adds helpers: `create_bp`, `add_component`, `list_components`, `get_cdo`/`set_cd
   `clear_dead_bindings` (orphaned FDelegateEditorBindings; the Bindings array is python-protected)
 - lifecycle: `compile_bp` (returns compiler errors/warnings), `fixup_redirectors`
 
+## unreal.FableNiagara — VFX authoring
+
+Compose-and-configure, deliberately **not** module-stack editing (see below).
+
+- read: `info` (emitters/renderers/User params), `list_user_params`, `dump_renderer`
+- configure: `set_user_param` (bare scalars OK — Niagara's single-field boxing is handled),
+  `set_renderer_props` (ImportText, same contract as `wt_set_props`), `set_emitter_enabled`
+- compose: `create_system`, **`add_emitter`** (copies an emitter from another system or a standalone
+  emitter asset — the primary authoring verb), `remove_emitter`, `duplicate_system`
+- lifecycle: `compile_system` (requests a compile), `is_ready` (read-only readiness probe)
+
+> **Compilation needs a tick you cannot give it.** Niagara registers compile work on the editor tick, but
+> a bridge call owns the game thread for its whole duration — so `ready` is always false in the same call
+> that edited the system, and looping/sleeping inside that call cannot help. Measured: false in the editing
+> call, true in the next one. Compile, let the call return, then poll `fx_ready()` separately before saving.
+
+`import fable` helpers: `fx_info`, `fx_params`, `fx_dump_renderer`, `fx_set`, `fx_set_renderer`,
+`fx_enable_emitter`, `fx_create`, `fx_add_emitter`, `fx_remove_emitter`, `fx_duplicate`, `fx_compile`.
+
+```bash
+python Plugins/FableKit/Tools/uexec.py -c "
+import fable
+fable.fx_create('/Game/FX', 'NS_MyHit')
+fable.fx_add_emitter('/Game/FX/NS_MyHit', '/Game/Effects/SomePack/NS_Spark', 'Sparks', 'Hit')
+fable.fx_set('/Game/FX/NS_MyHit', 'Color', '(R=1,G=0.4,B=0.1,A=1)')
+fable.fx_compile('/Game/FX/NS_MyHit'); fable.save('/Game/FX/NS_MyHit')
+"
+```
+
+**Why no module-stack editing.** Niagara's per-module rows (Particle Spawn/Update and their inputs)
+live behind editor-UI view models (`FNiagaraSystemViewModel` / `UNiagaraStackEntry`) that assume a live
+editor window and change shape between engine versions. Everything above uses the stable *asset* API
+instead. In practice you author one emitter by hand and clone/retune it from here forever, which is how
+VFX work goes anyway. Mutators refuse during PIE, call `KillSystemInstances` first (editing a system
+that has live components in a world is the classic Niagara editor crash), are transactional, and never
+auto-save.
+
 Conventions: JSON in/out everywhere; failed lookups return the valid options
 (pins/nodes/graphs/vars) so a caller can self-correct; node adds return the full
 pin list so wiring needs no re-dump; every mutator is transactional (**Ctrl+Z works**

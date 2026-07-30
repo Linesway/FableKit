@@ -70,45 +70,17 @@
 #include "Misc/EngineVersion.h"
 #include "Misc/PackageName.h"
 
+#include "FableJson.h"
+
 #define FABLEKIT_VERSION TEXT("1.0")
 
 namespace FableKitPrivate
 {
 
 // ------------------------------------------------------------------ JSON
-
-typedef TSharedPtr<FJsonObject> FJObj;
-typedef TSharedPtr<FJsonValue> FJVal;
-
-static FJObj NewObj() { return MakeShared<FJsonObject>(); }
-
-static FString ToJson(const FJObj& Obj)
-{
-	FString Out;
-	TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
-		TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Out);
-	FJsonSerializer::Serialize(Obj.ToSharedRef(), Writer);
-	return Out;
-}
-
-static FString Err(const FString& Msg)
-{
-	FJObj O = NewObj();
-	O->SetBoolField(TEXT("ok"), false);
-	O->SetStringField(TEXT("error"), Msg);
-	return ToJson(O);
-}
-
-static FString ErrWithList(const FString& Msg, const FString& ListKey, const TArray<FString>& List)
-{
-	FJObj O = NewObj();
-	O->SetBoolField(TEXT("ok"), false);
-	O->SetStringField(TEXT("error"), Msg);
-	TArray<FJVal> Vals;
-	for (const FString& S : List) { Vals.Add(MakeShared<FJsonValueString>(S)); }
-	O->SetArrayField(ListKey, Vals);
-	return ToJson(O);
-}
+// FJObj / FJVal / NewObj / ToJson / Err / ErrWithList / CheckMutate now live in FableJson.h, in this
+// same namespace — they were duplicated in FableNiagara.cpp and broke the unity build. See that
+// header before adding a helper here.
 
 static void SetStrArray(const FJObj& Obj, const FString& Key, const TArray<FString>& List)
 {
@@ -140,16 +112,6 @@ static UBlueprint* LoadBP(const FString& Path, FString& OutErr)
 		OutErr = FString::Printf(TEXT("Blueprint not found: %s"), *Norm);
 	}
 	return BP;
-}
-
-static bool CheckMutate(FString& OutErr)
-{
-	if (GEditor && GEditor->PlayWorld)
-	{
-		OutErr = TEXT("Refused: a PIE session is active. Stop play-in-editor first.");
-		return false;
-	}
-	return true;
 }
 
 struct FGraphInfo
