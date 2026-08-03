@@ -20,11 +20,11 @@
  * then just Read the PNG.
  *
  * WHAT YOU ARE LOOKING AT — read this before filing a bug against the render:
- *  - The widget is constructed with EWidgetDesignFlags::Designing, exactly like the editor's own
- *    asset-thumbnail renderer. UWidget::OnWidgetRebuilt takes its IsDesignTime() branch, so
- *    NativeConstruct and NativeOnInitialized NEVER run. A widget that dereferences a PlayerController
- *    or PlayerState in NativeConstruct therefore cannot take the editor down here — but it also means
- *    anything those functions would have filled in is absent.
+ *  - BY DEFAULT the widget is constructed with EWidgetDesignFlags::Designing, exactly like the
+ *    editor's own asset-thumbnail renderer. UWidget::OnWidgetRebuilt takes its IsDesignTime() branch,
+ *    so NativeConstruct and NativeOnInitialized NEVER run. A widget that dereferences a
+ *    PlayerController or PlayerState in NativeConstruct therefore cannot take the editor down here —
+ *    but it also means anything those functions would have filled in is absent.
  *  - So: text/icons/counts driven from live game state render as their DESIGN-TIME defaults (empty
  *    strings, placeholder numbers, default brushes). That is expected. The point of this is LAYOUT AND
  *    STYLING — spacing, alignment, colour, hierarchy, font sizes, overflow — not live data.
@@ -32,6 +32,15 @@
  *    because it is where designers put layout-affecting logic. It is the one piece of the widget's own
  *    code that executes, so it is also the one place a null-deref can still bite. If a specific widget
  *    kills the editor, re-run it with {"pre_construct": false}.
+ *  - {"live": true} OPTS OUT of the design-time safety and runs the REAL lifecycle:
+ *    NativeOnInitialized at Initialize, then NativePreConstruct + NativeConstruct from TakeWidget.
+ *    This is THE way to render/measure the screens that COMPOSE their layout in code (the chest, the
+ *    NPC menu, the achievements chrome, the Index of the Eye) — a Designing render of those shows
+ *    only the raw authored asset. Two caveats: (1) game code runs with NO owning player, so only use
+ *    it on widgets that null-guard GetOwningPlayer()/GetPS()/GetPC() — a hard deref CAN take the
+ *    editor down; (2) child widgets the screen spawns via CreateWidget(GetOwningPlayer(), ...) get a
+ *    null owner and are skipped, so item CELLS inside composed grids may be absent — judge the
+ *    layout, not the cell contents.
  *
  * Conventions (same as UFableBP / UFableNiagara):
  *  - Returns JSON. Failures are {"ok":false,"error":...} and carry enough context to self-correct.
@@ -68,6 +77,16 @@ public:
 	 *                         "pre_construct" – bool, default true. false skips NativePreConstruct (see
 	 *                                           the class comment) — the escape hatch for a widget whose
 	 *                                           PreConstruct crashes.
+	 *                         "live"          – bool, default false. true runs the REAL widget lifecycle
+	 *                                           (NativeOnInitialized + NativeConstruct) so runtime-composed
+	 *                                           screens render as they ship. Null-guarded widgets only —
+	 *                                           see the class comment for the exact trade.
+	 *                         "calls"         – array of ["FunctionName", arg, ...] invoked on the widget
+	 *                                           AFTER construction, BEFORE the draw — renders a specific
+	 *                                           STATE (a live search filter, a selected category, a page).
+	 *                                           Args fill parameters positionally; scalar/string/text
+	 *                                           parameter types only, and a failed call fails the render.
+	 *                                           e.g. {"live":true,"calls":[["SetSearchFilter","fps"]]}
 	 *
 	 * @return JSON. On success:
 	 *   {"ok":true,"widget":"/Game/...WBP_X","class":"/Game/...WBP_X_C","png":"C:/tmp/x.png",
@@ -111,4 +130,28 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "FableKit|Render")
 	static FString RenderMesh(const FString& AssetPath, const FString& OutPngPath, int32 Width, int32 Height, const FString& OptionsJson);
+
+	/**
+	 * MEASURE a Widget Blueprint: build it exactly like RenderWidget does, run a Slate prepass, then
+	 * report the DESIRED SIZE of the root and of every widget in its tree.
+	 *
+	 * WHY THIS EXISTS: a render shows you that a panel is too tall; it does not tell you WHICH child
+	 * is forcing the height. Working that out by setting properties and re-rendering costs a round
+	 * trip per guess and can easily be wrong several times in a row. This answers it directly — sort
+	 * the rows by height and the culprit is at the top.
+	 *
+	 * Same construction path and therefore the same caveats as RenderWidget: Designing flags by
+	 * default, so NativeConstruct never runs and anything filled in at runtime is absent (PreConstruct
+	 * DOES run) — and the same {"live": true} opt-out for measuring a runtime-composed tree.
+	 *
+	 * @param BlueprintPath Widget Blueprint asset path (or a UUserWidget class path).
+	 * @param Width,Height  Layout space to measure in. <= 0 measures unconstrained, which is what you
+	 *                      want when asking "how big does this WANT to be".
+	 * @param OptionsJson   "" for defaults; accepts "scale", "pre_construct" and "live" like RenderWidget.
+	 *
+	 * @return JSON: {"ok":true,"widget":..,"root_w":..,"root_h":..,"scale":..,
+	 *          "widgets":[{"name":..,"class":..,"parent":..,"desired_w":..,"desired_h":..},...]}
+	 */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Render")
+	static FString MeasureWidget(const FString& BlueprintPath, int32 Width, int32 Height, const FString& OptionsJson);
 };

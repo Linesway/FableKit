@@ -36,16 +36,21 @@
 #include "K2Node_StructOperation.h"
 #include "K2Node_FunctionEntry.h"
 #include "K2Node_FunctionResult.h"
+#include "K2Node_CallArrayFunction.h"
+#include "Engine/BlueprintGeneratedClass.h"
 #include "K2Node_EditablePinBase.h"
 #include "K2Node_AddPinInterface.h"
 #include "K2Node_BaseMCDelegate.h"
 #include "K2Node_CallDelegate.h"
 #include "K2Node_AddDelegate.h"
+#include "K2Node_ComponentBoundEvent.h"
+#include "EdGraphSchema_K2_Actions.h"
 
 #include "WidgetBlueprint.h"
 #include "WidgetBlueprintFactory.h"
 #include "Blueprint/UserWidget.h"
 #include "Blueprint/WidgetTree.h"
+#include "Animation/WidgetAnimation.h"   // WtListAnimations / WtRemoveAnimation
 #include "Modules/ModuleManager.h"
 #include "Components/Widget.h"
 #include "Components/PanelWidget.h"
@@ -995,7 +1000,25 @@ FString UFableBP::AddCallFunction(const FString& BlueprintPath, const FString& G
 	}
 
 	const FScopedTransaction Txn(FText::FromString(TEXT("FableKit: Add CallFunction")));
-	UK2Node_CallFunction* Node = NewObject<UK2Node_CallFunction>(Ctx.Graph);
+
+	/* PICK THE NODE CLASS THE WAY THE EDITOR DOES — a plain UK2Node_CallFunction is the WRONG class
+	 * for Array_Length / Array_Get / Array_Add / Array_Contains and every other member of
+	 * KismetArrayLibrary.
+	 *
+	 * Those functions declare an `ArrayParm` and the editor spawns UK2Node_CallArrayFunction for
+	 * them. That subclass is the only thing that carries the wildcard machinery: its
+	 * NotifyPinConnectionListChanged copies the element type off whatever gets attached to
+	 * TargetArray and runs PropagateArrayTypeInfo. Spawn the base class instead and you get a node
+	 * that LOOKS identical, accepts the connection, reports ok — and whose TargetArray stays
+	 * `array:wildcard&` forever, because there is no code on it that could ever resolve one. The
+	 * blueprint then fails with "The type of Target Array is undetermined. Connect something to
+	 * Length to imply a specific type" about a pin you can watch being connected.
+	 *
+	 * That cost an afternoon and produced the wrong conclusion — "array nodes cannot be authored
+	 * from a script" — when the truth was one missing subclass. */
+	UK2Node_CallFunction* Node = Func->HasMetaData(FBlueprintMetadata::MD_ArrayParam)
+		? NewObject<UK2Node_CallArrayFunction>(Ctx.Graph)
+		: NewObject<UK2Node_CallFunction>(Ctx.Graph);
 	Node->SetFromFunction(Func);
 	FinishSpawn(Ctx.BP, Ctx.Graph, Node, X, Y);
 	return OkNode(Node);
@@ -1295,6 +1318,73 @@ FString UFableBP::AddDispatcherBind(const FString& BlueprintPath, const FString&
 	return AddDispatcherNodeImpl(BlueprintPath, GraphName, DispatcherName, X, Y, true);
 }
 
+FString UFableBP::AddComponentBoundEvent(const FString& BlueprintPath, const FString& GraphName, const FString& ComponentName, const FString& DelegateName, float X, float Y)
+{
+	FGraphCtx Ctx = GetGraphCtx(BlueprintPath, GraphName, true);
+	if (!Ctx.IsValid()) { return Ctx.Error; }
+
+	UClass* Skel = Ctx.BP->SkeletonGeneratedClass ? Ctx.BP->SkeletonGeneratedClass.Get() : Ctx.BP->GeneratedClass.Get();
+	if (!Skel) { return Err(TEXT("Blueprint has no generated class — compile it first")); }
+
+	// The component/widget variable itself.
+	FObjectProperty* CompProp = FindFProperty<FObjectProperty>(Skel, FName(*ComponentName));
+	if (!CompProp)
+	{
+		TArray<FString> Names;
+		for (TFieldIterator<FObjectProperty> It(Skel); It; ++It)
+		{
+			// only things that can actually own a delegate
+			for (TFieldIterator<FMulticastDelegateProperty> D(It->PropertyClass); D; ++D) { Names.Add(It->GetName()); break; }
+		}
+		return ErrWithList(FString::Printf(TEXT("Component/widget variable '%s' not found on %s"), *ComponentName, *Skel->GetName()), TEXT("components"), Names);
+	}
+
+	// The multicast delegate declared on that variable's class.
+	FMulticastDelegateProperty* DelegateProp = CompProp->PropertyClass
+		? FindFProperty<FMulticastDelegateProperty>(CompProp->PropertyClass, FName(*DelegateName)) : nullptr;
+	if (!DelegateProp)
+	{
+		TArray<FString> Names;
+		if (CompProp->PropertyClass)
+		{
+			for (TFieldIterator<FMulticastDelegateProperty> It(CompProp->PropertyClass); It; ++It) { Names.Add(It->GetName()); }
+		}
+		return ErrWithList(FString::Printf(TEXT("Delegate '%s' not found on %s"), *DelegateName,
+			CompProp->PropertyClass ? *CompProp->PropertyClass->GetName() : TEXT("<null class>")), TEXT("delegates"), Names);
+	}
+
+	// One bound event per (component, delegate) pair — hand the existing one back so jobs stay idempotent.
+	// FindBoundEventForComponent returns a CONST pointer in 5.6; NodeToJson only reads it, so cast the
+	// qualifier off rather than widening NodeToJson's signature.
+	if (const UK2Node_ComponentBoundEvent* ExistingBound =
+		FKismetEditorUtilities::FindBoundEventForComponent(Ctx.BP, DelegateProp->GetFName(), CompProp->GetFName()))
+	{
+		FJObj O = NewObj();
+		O->SetBoolField(TEXT("ok"), true);
+		O->SetBoolField(TEXT("existing"), true);
+		O->SetObjectField(TEXT("node"), NodeToJson(const_cast<UK2Node_ComponentBoundEvent*>(ExistingBound), true));
+		return ToJson(O);
+	}
+
+	// Spawned through the schema action rather than FinishSpawn: InitializeComponentBoundEventParams
+	// has to run BETWEEN construction and AllocateDefaultPins (it is what fills EventReference, and
+	// the delegate signature pins are built from that), and it calls GetBlueprint() on the way.
+	// This is the exact ordering FKismetEditorUtilities::CreateNewBoundEventForClass uses.
+	const FScopedTransaction Txn(FText::FromString(TEXT("FableKit: Add Component Bound Event")));
+	Ctx.Graph->Modify();
+	UK2Node_ComponentBoundEvent* Node = FEdGraphSchemaAction_K2NewNode::SpawnNode<UK2Node_ComponentBoundEvent>(
+		Ctx.Graph,
+		FVector2D(X, Y),
+		EK2NewNodeFlags::None,
+		[CompProp, DelegateProp](UK2Node_ComponentBoundEvent* NewInstance)
+		{
+			NewInstance->InitializeComponentBoundEventParams(CompProp, DelegateProp);
+		});
+	if (!Node) { return Err(TEXT("SpawnNode returned null")); }
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Ctx.BP);
+	return OkNode(Node);
+}
+
 FString UFableBP::AddNodeByClass(const FString& BlueprintPath, const FString& GraphName, const FString& NodeClassPath, float X, float Y)
 {
 	FGraphCtx Ctx = GetGraphCtx(BlueprintPath, GraphName, true);
@@ -1438,19 +1528,57 @@ FString UFableBP::ConnectPins(const FString& BlueprintPath, const FString& Graph
 	const FScopedTransaction Txn(FText::FromString(TEXT("FableKit: Connect Pins")));
 	NA->Modify();
 	NB->Modify();
-	const bool bOk = Schema->TryCreateConnection(PA, PB);
-	if (bOk) { FBlueprintEditorUtils::MarkBlueprintAsModified(Ctx.BP); }
+	const bool bTried = Schema->TryCreateConnection(PA, PB);
+
+	/* WILDCARD PINS ONLY RESOLVE WHEN THEIR NODE IS TOLD THE LINK CHANGED.
+	 *
+	 * TryCreateConnection makes the link, but a K2 array node (Array_Length, Array_Get, Array_Add…)
+	 * carries `array:wildcard` pins whose concrete type is derived in
+	 * UK2Node_CallArrayFunction::NotifyPinConnectionListChanged — it reads the newly connected
+	 * array and propagates its element type across every other wildcard pin on the node.
+	 * Without this the link genuinely exists and the pin STAYS wildcard, so the blueprint fails to
+	 * compile with "The type of Target Array is undetermined. Connect something to Length to imply
+	 * a specific type." — an error that describes the exact connection you just made successfully.
+	 * That cost an afternoon of chasing a wiring bug that was not a wiring bug. */
+	if (bTried)
+	{
+		/* It must be UK2Node::NotifyPinConnectionListChanged, NOT UEdGraphNode::PinConnectionListChanged.
+		 * Only the former reaches UK2Node_CallArrayFunction::NotifyPinConnectionListChanged, which
+		 * calls PropagateArrayTypeInfo — the function that copies the connected array's element type
+		 * onto every other wildcard pin on the node. Calling the base virtual links the pins and
+		 * leaves the type as `array:wildcard&`, which is indistinguishable from "you forgot to
+		 * connect it" in the compiler output. */
+		if (UK2Node* KA = Cast<UK2Node>(NA)) { KA->NotifyPinConnectionListChanged(PA); }
+		else { NA->PinConnectionListChanged(PA); }
+		if (UK2Node* KB = Cast<UK2Node>(NB)) { KB->NotifyPinConnectionListChanged(PB); }
+		else { NB->PinConnectionListChanged(PB); }
+		FBlueprintEditorUtils::MarkBlueprintAsModified(Ctx.BP);
+	}
+
+	/* AND REPORT WHAT IS ACTUALLY TRUE, not what TryCreateConnection returned.
+	 * Reporting the attempt made `ok:true` mean "the schema did not object", which a caller
+	 * reasonably reads as "connected" — so a raise-on-failure wrapper never fires and the script
+	 * looks like it wired a graph it did not. Same silent-success family as wt_set applying nothing
+	 * and ImportText keeping the fields it did not recognise. Verify from the pin. */
+	const bool bLinked = PA->LinkedTo.Contains(PB) && PB->LinkedTo.Contains(PA);
 
 	FJObj O = NewObj();
-	O->SetBoolField(TEXT("ok"), bOk);
+	O->SetBoolField(TEXT("ok"), bLinked);
+	O->SetBoolField(TEXT("schema_allowed"), bTried);
 	O->SetStringField(TEXT("response"), Response.Message.ToString());
-	if (!bOk && Response.Message.IsEmpty())
+	O->SetStringField(TEXT("pin_a_type"), UEdGraphSchema_K2::TypeToText(PA->PinType).ToString());
+	O->SetStringField(TEXT("pin_b_type"), UEdGraphSchema_K2::TypeToText(PB->PinType).ToString());
+	// A pin still reading "wildcard" after a successful connect means propagation did not run —
+	// surface it rather than letting it show up later as an undetermined-type compile error.
+	O->SetBoolField(TEXT("still_wildcard"),
+		PA->PinType.PinCategory == UEdGraphSchema_K2::PC_Wildcard ||
+		PB->PinType.PinCategory == UEdGraphSchema_K2::PC_Wildcard);
+	if (!bLinked)
 	{
-		O->SetStringField(TEXT("error"), TEXT("Connection refused by schema"));
-	}
-	else if (!bOk)
-	{
-		O->SetStringField(TEXT("error"), Response.Message.ToString());
+		O->SetStringField(TEXT("error"), Response.Message.IsEmpty()
+			? (bTried ? TEXT("TryCreateConnection reported success but the pins are not linked")
+			          : TEXT("Connection refused by schema"))
+			: Response.Message.ToString());
 	}
 	return ToJson(O);
 }
@@ -1725,6 +1853,146 @@ FString UFableBP::WtRemoveWidget(const FString& BlueprintPath, const FString& Wi
 	return ToJson(O);
 }
 
+FString UFableBP::WtReparentWidget(const FString& BlueprintPath, const FString& WidgetName, const FString& NewParentName, int32 Index)
+{
+	FString E;
+	UWidgetBlueprint* WBP = LoadWBP(BlueprintPath, E);
+	if (!WBP) { return Err(E); }
+	if (!CheckMutate(E)) { return Err(E); }
+	if (!WBP->WidgetTree) { return Err(TEXT("Widget has no WidgetTree")); }
+
+	UWidget* W = FindTreeWidget(WBP, WidgetName, E);
+	if (!W) { return E; }
+	if (WBP->WidgetTree->RootWidget == W)
+	{
+		return Err(TEXT("Cannot reparent the ROOT widget"));
+	}
+
+	UWidget* NewParent = FindTreeWidget(WBP, NewParentName, E);
+	if (!NewParent) { return E; }
+	if (NewParent == W)
+	{
+		return Err(TEXT("Cannot parent a widget to itself"));
+	}
+
+	// Cycle guard: walking UP from the new parent must never reach the widget being moved, or the
+	// tree would detach itself into an orphaned loop.
+	for (UWidget* P = NewParent; P; P = P->GetParent())
+	{
+		if (P == W)
+		{
+			return Err(FString::Printf(TEXT("'%s' is inside '%s' — that would make a cycle"), *NewParentName, *WidgetName));
+		}
+	}
+
+	UPanelWidget* Panel = Cast<UPanelWidget>(NewParent);
+	UContentWidget* Content = Cast<UContentWidget>(NewParent);
+	if (!Panel && !Content)
+	{
+		return Err(FString::Printf(TEXT("New parent '%s' (%s) cannot hold children"), *NewParentName, *NewParent->GetClass()->GetName()));
+	}
+	// A UContentWidget holds exactly one child; silently dropping whatever is already in there is
+	// the kind of data loss that is very hard to notice afterwards.
+	if (Content && Content->GetContentSlot() && Content->GetContentSlot()->Content && Content->GetContentSlot()->Content != W)
+	{
+		return Err(FString::Printf(TEXT("'%s' already holds '%s' — remove it first"), *NewParentName,
+			*Content->GetContentSlot()->Content->GetName()));
+	}
+
+	const FScopedTransaction Txn(FText::FromString(TEXT("FableKit: Reparent Tree Widget")));
+	WBP->WidgetTree->Modify();
+
+	const FString OldParentName = W->GetParent() ? W->GetParent()->GetName() : TEXT("");
+
+	// RemoveChild + AddChild MOVES the same UWidget object, so every authored property on it (fonts,
+	// brushes, tints, template variables) survives. Only the SLOT is rebuilt — slot padding/alignment
+	// must be re-applied by the caller.
+	if (UPanelWidget* OldParent = W->GetParent())
+	{
+		OldParent->Modify();
+		OldParent->RemoveChild(W);
+	}
+
+	if (Panel)
+	{
+		Panel->Modify();
+		if (!Panel->AddChild(W))
+		{
+			return Err(FString::Printf(TEXT("AddChild refused — '%s' is probably full (%s)"), *NewParentName, *Panel->GetClass()->GetName()));
+		}
+		if (Index >= 0 && Index < Panel->GetChildrenCount())
+		{
+			Panel->ShiftChild(Index, W);
+		}
+	}
+	else
+	{
+		Content->Modify();
+		Content->SetContent(W);
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WBP);
+
+	FJObj O = NewObj();
+	O->SetBoolField(TEXT("ok"), true);
+	O->SetStringField(TEXT("name"), W->GetName());
+	O->SetStringField(TEXT("from"), OldParentName);
+	O->SetStringField(TEXT("to"), NewParent->GetName());
+	O->SetNumberField(TEXT("index"), Panel ? Panel->GetChildIndex(W) : 0);
+	O->SetStringField(TEXT("slot"), W->Slot ? W->Slot->GetClass()->GetName() : TEXT(""));
+	return ToJson(O);
+}
+
+FString UFableBP::WtGetProps(const FString& BlueprintPath, const FString& WidgetName, const FString& PropsCsv)
+{
+	FString E;
+	UWidgetBlueprint* WBP = LoadWBP(BlueprintPath, E);
+	if (!WBP) { return Err(E); }
+	UWidget* W = FindTreeWidget(WBP, WidgetName, E);
+	if (!W) { return E; }
+
+	// Empty filter = dump everything. Otherwise match on EITHER spelling, because a Blueprint
+	// variable's authored name ("In Font Info") and its internal name can differ.
+	TSet<FString> Wanted;
+	if (!PropsCsv.IsEmpty())
+	{
+		TArray<FString> Parts;
+		PropsCsv.ParseIntoArray(Parts, TEXT(","), true);
+		for (FString& P : Parts)
+		{
+			Wanted.Add(P.TrimStartAndEnd());
+		}
+	}
+
+	FJObj Props = NewObj();
+	int32 Count = 0;
+	for (TFieldIterator<FProperty> It(W->GetClass()); It; ++It)
+	{
+		FProperty* P = *It;
+		const FString Internal = P->GetName();
+		const FString Authored = P->GetAuthoredName();
+		if (Wanted.Num() > 0 && !Wanted.Contains(Internal) && !Wanted.Contains(Authored))
+		{
+			continue;
+		}
+
+		FString Value;
+		// Exported in the SAME text form WtSetProps imports, so a value read here can be written
+		// straight back onto another widget with no translation.
+		P->ExportText_InContainer(0, Value, W, W, W, PPF_None);
+		Props->SetStringField(Authored.IsEmpty() ? Internal : Authored, Value);
+		++Count;
+	}
+
+	FJObj O = NewObj();
+	O->SetBoolField(TEXT("ok"), true);
+	O->SetStringField(TEXT("name"), W->GetName());
+	O->SetStringField(TEXT("class"), W->GetClass()->GetName());
+	O->SetNumberField(TEXT("count"), Count);
+	O->SetObjectField(TEXT("props"), Props);
+	return ToJson(O);
+}
+
 static FString SetPropsOnObject(UWidgetBlueprint* WBP, UObject* Target, const FString& PropsJson)
 {
 	TSharedPtr<FJsonObject> Props;
@@ -1781,6 +2049,58 @@ FString UFableBP::WtSetSlotProps(const FString& BlueprintPath, const FString& Wi
 	if (!W) { return E; }
 	if (!W->Slot) { return Err(FString::Printf(TEXT("'%s' has no layout slot (is it the root?)"), *WidgetName)); }
 	return SetPropsOnObject(WBP, W->Slot, PropsJson);
+}
+
+FString UFableBP::WtListAnimations(const FString& BlueprintPath)
+{
+	FString E;
+	UWidgetBlueprint* WBP = LoadWBP(BlueprintPath, E);
+	if (!WBP) { return Err(E); }
+
+	TArray<FString> Names;
+	for (const UWidgetAnimation* Anim : WBP->Animations)
+	{
+		if (Anim) { Names.Add(Anim->GetName()); }
+	}
+
+	FJObj O = NewObj();
+	O->SetBoolField(TEXT("ok"), true);
+	SetStrArray(O, TEXT("animations"), Names);
+	return ToJson(O);
+}
+
+FString UFableBP::WtRemoveAnimation(const FString& BlueprintPath, const FString& AnimationName)
+{
+	FString E;
+	UWidgetBlueprint* WBP = LoadWBP(BlueprintPath, E);
+	if (!WBP) { return Err(E); }
+	if (!CheckMutate(E)) { return Err(E); }
+
+	const FScopedTransaction Txn(FText::FromString(TEXT("FableKit: Remove Widget Animation")));
+	WBP->Modify();
+
+	TArray<FString> Removed;
+	// Empty name = remove every animation. That is the useful bulk case: a tree that has been rebuilt
+	// leaves EVERY animation pointing at names that no longer exist.
+	const bool bAll = AnimationName.IsEmpty();
+	for (int32 i = WBP->Animations.Num() - 1; i >= 0; --i)
+	{
+		UWidgetAnimation* Anim = WBP->Animations[i];
+		if (!Anim) { WBP->Animations.RemoveAt(i); continue; }
+		if (bAll || Anim->GetName() == AnimationName)
+		{
+			Removed.Add(Anim->GetName());
+			WBP->Animations.RemoveAt(i);
+		}
+	}
+
+	// Structural: animations become properties on the generated class, so the class layout changes.
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WBP);
+
+	FJObj O = NewObj();
+	O->SetBoolField(TEXT("ok"), Removed.Num() > 0 || bAll);
+	SetStrArray(O, TEXT("removed"), Removed);
+	return ToJson(O);
 }
 
 FString UFableBP::SetPinDefault(const FString& BlueprintPath, const FString& GraphName, const FString& NodeId, const FString& PinName, const FString& Value)
@@ -1913,6 +2233,394 @@ FString UFableBP::RemoveVariable(const FString& BlueprintPath, const FString& Va
 
 	FJObj O = NewObj();
 	O->SetBoolField(TEXT("ok"), true);
+	return ToJson(O);
+}
+
+FString UFableBP::SetVariableType(const FString& BlueprintPath, const FString& VarName, const FString& Type)
+{
+	FString E;
+	if (!CheckMutate(E)) { return Err(E); }
+	UBlueprint* BP = LoadBP(BlueprintPath, E);
+	if (!BP) { return Err(E); }
+
+	const FName VarFName(*VarName);
+	if (FindBPVarIndex(BP, VarFName) == INDEX_NONE)
+	{
+		return Err(FString::Printf(TEXT("Variable '%s' is not declared on this BP"), *VarName));
+	}
+
+	FEdGraphPinType T;
+	if (!ParseType(Type, T, E)) { return Err(E); }
+
+	const FScopedTransaction Txn(FText::FromString(TEXT("FableKit: Set Variable Type")));
+	BP->Modify();
+	FBlueprintEditorUtils::ChangeMemberVariableType(BP, VarFName, T);
+
+	/* CHANGING THE DECLARATION IS ONLY HALF OF IT.
+	 *
+	 * ChangeMemberVariableType retypes the variable, but every Get/Set node in the graph is still
+	 * holding a pin of the OLD type. Reconstructing them normally KEEPS that pin as an orphan,
+	 * because it has links — and the compiler then reports "In use pin 'X' no longer exists on node
+	 * Get. Please refresh node or break links", once per node, about a graph that looks untouched.
+	 *
+	 * Reconstruct with orphan saving off so the stale pin goes away instead of lingering, then
+	 * RefreshAllNodes so everything downstream (ForEach macros, array nodes, call sites) re-derives
+	 * against the new type. This is the same sequence the editor runs when you retype a variable in
+	 * the My Blueprint panel. */
+	struct FSavedLink
+	{
+		UEdGraphNode*         Node = nullptr;   // the variable node
+		FName                 PinName;
+		EEdGraphPinDirection  Dir = EGPD_Input;
+		UEdGraphNode*         Other = nullptr;
+		FName                 OtherPinName;
+		EEdGraphPinDirection  OtherDir = EGPD_Input;
+	};
+
+	TArray<UK2Node_Variable*> VarNodes;
+	FBlueprintEditorUtils::GetAllNodesOfClass<UK2Node_Variable>(BP, VarNodes);
+
+	TArray<UK2Node_Variable*> Mine;
+	TArray<FSavedLink> Saved;
+	TSet<UEdGraphNode*> Partners;
+	for (UK2Node_Variable* VN : VarNodes)
+	{
+		if (!IsValid(VN) || VN->VariableReference.GetMemberName() != VarFName) { continue; }
+		Mine.Add(VN);
+		for (UEdGraphPin* P : VN->Pins)
+		{
+			if (!P) { continue; }
+			for (UEdGraphPin* L : P->LinkedTo)
+			{
+				if (!L || !L->GetOwningNodeUnchecked()) { continue; }
+				Saved.Add({ VN, P->PinName, P->Direction,
+				            L->GetOwningNode(), L->PinName, L->Direction });
+				Partners.Add(L->GetOwningNode());
+			}
+		}
+	}
+
+	/* Both ends have to be rebuilt before anything is re-linked.
+	 *
+	 * The variable node keeps a pin of the OLD type until it is reconstructed, and reconstructing it
+	 * normally leaves that pin behind as an orphan — the "In use pin 'X' no longer exists" error, one
+	 * per node, about a graph that reads as correct. Purging is the fix, but purging DROPS the links,
+	 * and the partner on the other end (Array_Add, Array_Length, a ForEach macro) is a
+	 * UK2Node_CallArrayFunction whose TargetArray falls back to array:wildcard& with nothing left to
+	 * derive a type from. That is the "The type of Target Array is undetermined" error, and it is
+	 * caused by the repair rather than by the retype.
+	 *
+	 * So: remember every link first, rebuild both ends, then put the links back and tell each node
+	 * its connections changed. That last call is the one that matters —
+	 * UK2Node_CallArrayFunction::NotifyPinConnectionListChanged is what copies the element type off
+	 * the newly-attached pin and runs PropagateArrayTypeInfo. Reconstructing alone never does it. */
+	int32 Refreshed = 0;
+	for (UK2Node_Variable* VN : Mine)
+	{
+		VN->Modify();
+		const bool bPrev = VN->bDisableOrphanPinSaving;
+		VN->bDisableOrphanPinSaving = true;
+		VN->ReconstructNode();
+		VN->bDisableOrphanPinSaving = bPrev;
+		++Refreshed;
+	}
+	for (UEdGraphNode* PN : Partners)
+	{
+		if (!IsValid(PN)) { continue; }
+		PN->Modify();
+		const bool bPrev = PN->bDisableOrphanPinSaving;
+		PN->bDisableOrphanPinSaving = true;
+		PN->ReconstructNode();
+		PN->bDisableOrphanPinSaving = bPrev;
+	}
+
+	int32 Restored = 0, Failed = 0;
+	const UEdGraphSchema_K2* K2 = GetDefault<UEdGraphSchema_K2>();
+	for (const FSavedLink& L : Saved)
+	{
+		if (!IsValid(L.Node) || !IsValid(L.Other)) { ++Failed; continue; }
+		UEdGraphPin* A = L.Node->FindPin(L.PinName, L.Dir);
+		UEdGraphPin* B = L.Other->FindPin(L.OtherPinName, L.OtherDir);
+		if (!A || !B) { ++Failed; continue; }
+		if (A->LinkedTo.Contains(B)) { ++Restored; continue; }
+
+		if (!K2->TryCreateConnection(A, B)) { ++Failed; continue; }
+
+		if (UK2Node* KA = Cast<UK2Node>(L.Node))  { KA->NotifyPinConnectionListChanged(A); }
+		if (UK2Node* KB = Cast<UK2Node>(L.Other)) { KB->NotifyPinConnectionListChanged(B); }
+		++Restored;
+	}
+
+	FBlueprintEditorUtils::RefreshAllNodes(BP);
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+
+	FJObj O = NewObj();
+	O->SetBoolField(TEXT("ok"), true);
+	O->SetNumberField(TEXT("nodes_refreshed"), Refreshed);
+	O->SetNumberField(TEXT("links_saved"), Saved.Num());
+	O->SetNumberField(TEXT("links_restored"), Restored);
+	O->SetNumberField(TEXT("links_failed"), Failed);
+	const int32 Idx = FindBPVarIndex(BP, VarFName);
+	if (Idx != INDEX_NONE) { O->SetObjectField(TEXT("variable"), VarToJson(BP->NewVariables[Idx])); }
+	return ToJson(O);
+}
+
+FString UFableBP::RetargetVariableRefs(const FString& BlueprintPath, const FString& OldClassPath, const FString& NewClassPath)
+{
+	FString E;
+	if (!CheckMutate(E)) { return Err(E); }
+	UBlueprint* BP = LoadBP(BlueprintPath, E);
+	if (!BP) { return Err(E); }
+
+	UClass* OldClass = LoadObject<UClass>(nullptr, *OldClassPath);
+	if (!OldClass) { OldClass = LoadObject<UClass>(nullptr, *NormalizeAssetPath(OldClassPath)); }
+	UClass* NewClass = LoadObject<UClass>(nullptr, *NewClassPath);
+	if (!NewClass) { NewClass = LoadObject<UClass>(nullptr, *NormalizeAssetPath(NewClassPath)); }
+	if (!OldClass) { return Err(FString::Printf(TEXT("Could not load old class '%s'"), *OldClassPath)); }
+	if (!NewClass) { return Err(FString::Printf(TEXT("Could not load new class '%s'"), *NewClassPath)); }
+
+	const FScopedTransaction Txn(FText::FromString(TEXT("FableKit: Retarget Variable Refs")));
+	BP->Modify();
+
+	TArray<UK2Node_Variable*> VarNodes;
+	FBlueprintEditorUtils::GetAllNodesOfClass<UK2Node_Variable>(BP, VarNodes);
+
+	int32 Moved = 0;
+	TArray<TSharedPtr<FJsonValue>> Skipped;
+	for (UK2Node_Variable* VN : VarNodes)
+	{
+		if (!IsValid(VN)) { continue; }
+		UClass* Scope = VN->VariableReference.GetMemberParentClass(VN->GetBlueprintClassFromNode());
+		if (Scope != OldClass) { continue; }
+
+		const FName VarName = VN->VariableReference.GetMemberName();
+		if (!FindFProperty<FProperty>(NewClass, VarName))
+		{
+			Skipped.Add(MakeShared<FJsonValueString>(VarName.ToString()));
+			continue;
+		}
+
+		VN->Modify();
+		VN->VariableReference.SetExternalMember(VarName, NewClass);
+		const bool bPrev = VN->bDisableOrphanPinSaving;
+		VN->bDisableOrphanPinSaving = true;
+		VN->ReconstructNode();
+		VN->bDisableOrphanPinSaving = bPrev;
+		++Moved;
+	}
+
+	FBlueprintEditorUtils::RefreshAllNodes(BP);
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+
+	FJObj O = NewObj();
+	O->SetBoolField(TEXT("ok"), true);
+	O->SetNumberField(TEXT("retargeted"), Moved);
+	O->SetArrayField(TEXT("skipped"), Skipped);
+	return ToJson(O);
+}
+
+FString UFableBP::ResetMacroWildcards(const FString& BlueprintPath, const FString& GraphName, const FString& NodeId)
+{
+	FGraphCtx Ctx = GetGraphCtx(BlueprintPath, GraphName, true);
+	if (!Ctx.IsValid()) { return Ctx.Error; }
+	FString E;
+	UEdGraphNode* N = FindNode(Ctx.Graph, NodeId, E);
+	if (!N) { return E; }
+
+	UK2Node_MacroInstance* Macro = Cast<UK2Node_MacroInstance>(N);
+	if (!Macro) { return Err(TEXT("Node is not a macro instance")); }
+
+	const FScopedTransaction Txn(FText::FromString(TEXT("FableKit: Reset Macro Wildcards")));
+	Macro->Modify();
+
+	int32 Broken = 0;
+	for (UEdGraphPin* P : Macro->Pins)
+	{
+		if (P && P->LinkedTo.Num() > 0)
+		{
+			Broken += P->LinkedTo.Num();
+			P->BreakAllPinLinks();
+		}
+	}
+
+	const FString Was = Macro->ResolvedWildcardType.PinCategory.ToString();
+	Macro->ResolvedWildcardType.ResetToDefaults();
+
+	const bool bPrev = Macro->bDisableOrphanPinSaving;
+	Macro->bDisableOrphanPinSaving = true;
+	Macro->ReconstructNode();
+	Macro->bDisableOrphanPinSaving = bPrev;
+	FBlueprintEditorUtils::MarkBlueprintAsModified(Ctx.BP);
+
+	FJObj O = NewObj();
+	O->SetBoolField(TEXT("ok"), true);
+	O->SetNumberField(TEXT("links_broken"), Broken);
+	O->SetStringField(TEXT("resolved_type_was"), Was);
+	O->SetObjectField(TEXT("node"), NodeToJson(N, true));
+	return ToJson(O);
+}
+
+FString UFableBP::RetargetFunctionCalls(const FString& BlueprintPath, const FString& OldClassPath, const FString& NewClassPath)
+{
+	FString E;
+	if (!CheckMutate(E)) { return Err(E); }
+	UBlueprint* BP = LoadBP(BlueprintPath, E);
+	if (!BP) { return Err(E); }
+
+	UClass* OldClass = LoadObject<UClass>(nullptr, *OldClassPath);
+	if (!OldClass) { OldClass = LoadObject<UClass>(nullptr, *NormalizeAssetPath(OldClassPath)); }
+	UClass* NewClass = LoadObject<UClass>(nullptr, *NewClassPath);
+	if (!NewClass) { NewClass = LoadObject<UClass>(nullptr, *NormalizeAssetPath(NewClassPath)); }
+	if (!OldClass) { return Err(FString::Printf(TEXT("Could not load old class '%s'"), *OldClassPath)); }
+	if (!NewClass) { return Err(FString::Printf(TEXT("Could not load new class '%s'"), *NewClassPath)); }
+
+	const FScopedTransaction Txn(FText::FromString(TEXT("FableKit: Retarget Function Calls")));
+	BP->Modify();
+
+	TArray<UK2Node_CallFunction*> Calls;
+	FBlueprintEditorUtils::GetAllNodesOfClass<UK2Node_CallFunction>(BP, Calls);
+
+	int32 Moved = 0;
+	TArray<TSharedPtr<FJsonValue>> Skipped;
+	for (UK2Node_CallFunction* Call : Calls)
+	{
+		if (!IsValid(Call)) { continue; }
+		UClass* Scope = Call->FunctionReference.GetMemberParentClass(Call->GetBlueprintClassFromNode());
+		if (Scope != OldClass) { continue; }
+
+		const FName FuncName = Call->FunctionReference.GetMemberName();
+		if (!NewClass->FindFunctionByName(FuncName))
+		{
+			Skipped.Add(MakeShared<FJsonValueString>(FuncName.ToString()));
+			continue;
+		}
+
+		Call->Modify();
+		Call->FunctionReference.SetExternalMember(FuncName, NewClass);
+		const bool bPrev = Call->bDisableOrphanPinSaving;
+		Call->bDisableOrphanPinSaving = true;
+		Call->ReconstructNode();
+		Call->bDisableOrphanPinSaving = bPrev;
+		++Moved;
+	}
+
+	FBlueprintEditorUtils::RefreshAllNodes(BP);
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+
+	FJObj O = NewObj();
+	O->SetBoolField(TEXT("ok"), true);
+	O->SetNumberField(TEXT("retargeted"), Moved);
+	O->SetArrayField(TEXT("skipped"), Skipped);
+	return ToJson(O);
+}
+
+FString UFableBP::ReconstructNodePurgeOrphans(const FString& BlueprintPath, const FString& GraphName, const FString& NodeId)
+{
+	FGraphCtx Ctx = GetGraphCtx(BlueprintPath, GraphName, true);
+	if (!Ctx.IsValid()) { return Ctx.Error; }
+	FString E;
+	UEdGraphNode* N = FindNode(Ctx.Graph, NodeId, E);
+	if (!N) { return E; }
+
+	const FScopedTransaction Txn(FText::FromString(TEXT("FableKit: Reconstruct Node (purge orphans)")));
+	N->Modify();
+	const bool bPrev = N->bDisableOrphanPinSaving;
+	N->bDisableOrphanPinSaving = true;
+	N->ReconstructNode();
+	N->bDisableOrphanPinSaving = bPrev;
+	FBlueprintEditorUtils::MarkBlueprintAsModified(Ctx.BP);
+	return OkNode(N);
+}
+
+FString UFableBP::SetUserPinType(const FString& BlueprintPath, const FString& GraphName, const FString& NodeId, const FString& PinName, const FString& Type)
+{
+	FGraphCtx Ctx = GetGraphCtx(BlueprintPath, GraphName, true);
+	if (!Ctx.IsValid()) { return Ctx.Error; }
+	FString E;
+	UEdGraphNode* N = FindNode(Ctx.Graph, NodeId, E);
+	if (!N) { return E; }
+
+	UK2Node_EditablePinBase* Editable = Cast<UK2Node_EditablePinBase>(N);
+	if (!Editable) { return Err(TEXT("Node is not a custom event / function entry / function result")); }
+
+	FEdGraphPinType T;
+	if (!ParseType(Type, T, E)) { return Err(E); }
+
+	TSharedPtr<FUserPinInfo> Found;
+	for (TSharedPtr<FUserPinInfo>& Info : Editable->UserDefinedPins)
+	{
+		if (Info.IsValid() && Info->PinName == FName(*PinName)) { Found = Info; break; }
+	}
+	if (!Found.IsValid())
+	{
+		FString Have;
+		for (const TSharedPtr<FUserPinInfo>& Info : Editable->UserDefinedPins)
+		{
+			if (Info.IsValid()) { Have += (Have.IsEmpty() ? TEXT("") : TEXT(", ")) + Info->PinName.ToString(); }
+		}
+		return Err(FString::Printf(TEXT("No user-defined pin '%s' on this node (has: %s)"), *PinName, *Have));
+	}
+
+	/* THERE IS NO ModifyUserDefinedPinType. The editor's own "change a parameter's type" path lives in
+	 * FBaseBlueprintGraphActionDetails (BlueprintDetailsCustomization.cpp) and is open-coded: assign
+	 * the FUserPinInfo's type, clear the now-meaningless default, then reconstruct the declaring node
+	 * with orphan-pin saving OFF so the old-typed pin is dropped instead of being kept as an orphan.
+	 * Reproduced here step for step. */
+	const FScopedTransaction Txn(FText::FromString(TEXT("FableKit: Set User Pin Type")));
+	N->Modify();
+	Found->PinType = T;
+	if (!T.bIsConst && Editable->ShouldUseConstRefParams())
+	{
+		Found->PinType.bIsConst = T.IsArray() || T.bIsReference;
+	}
+	Found->PinDefaultValue.Reset();
+
+	{
+		const bool bPrevDisableOrphanSaving = Editable->bDisableOrphanPinSaving;
+		Editable->bDisableOrphanPinSaving = true;
+		Editable->ReconstructNode();
+		Editable->bDisableOrphanPinSaving = bPrevDisableOrphanSaving;
+	}
+	GetDefault<UEdGraphSchema_K2>()->HandleParameterDefaultValueChanged(Editable);
+
+	/* RECONSTRUCT EVERY CALLER, NOT JUST THIS NODE.
+	 *
+	 * Retyping the declaration leaves each call site still holding a pin of the OLD type. The graph
+	 * looks right - the link is drawn - and the blueprint refuses to compile with a type mismatch on
+	 * a pin nobody touched. Reconstructing the callers is what actually republishes the signature. */
+	/* A custom event node's GetFName() is its NODE id ("K2Node_CustomEvent_3"), not the event name
+	 * callers reference — matching on it finds zero call sites and silently leaves every caller
+	 * holding the old type. CustomFunctionName is the name that goes on the generated UFunction. */
+	int32 Rebuilt = 0;
+	FName EventName = N->GetFName();
+	if (UK2Node_CustomEvent* AsCustom = Cast<UK2Node_CustomEvent>(N))
+	{
+		EventName = AsCustom->CustomFunctionName;
+	}
+	else if (N->IsA<UK2Node_FunctionEntry>() || N->IsA<UK2Node_FunctionResult>())
+	{
+		EventName = N->GetGraph() ? N->GetGraph()->GetFName() : EventName;
+	}
+
+	TArray<UK2Node_CallFunction*> Calls;
+	FBlueprintEditorUtils::GetAllNodesOfClass<UK2Node_CallFunction>(Ctx.BP, Calls);
+	for (UK2Node_CallFunction* Call : Calls)
+	{
+		if (!IsValid(Call) || Call->FunctionReference.GetMemberName() != EventName) { continue; }
+		Call->Modify();
+		const bool bPrev = Call->bDisableOrphanPinSaving;
+		Call->bDisableOrphanPinSaving = true;
+		Call->ReconstructNode();
+		Call->bDisableOrphanPinSaving = bPrev;
+		++Rebuilt;
+	}
+	FBlueprintEditorUtils::RefreshAllNodes(Ctx.BP);
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Ctx.BP);
+
+	FJObj O = NewObj();
+	O->SetBoolField(TEXT("ok"), true);
+	O->SetNumberField(TEXT("callers_reconstructed"), Rebuilt);
+	O->SetObjectField(TEXT("node"), NodeToJson(N, true));
 	return ToJson(O);
 }
 
@@ -2183,13 +2891,79 @@ FString UFableBP::CompileBP(const FString& BlueprintPath)
 		}
 	}
 
+	/* -------------------------------------------------------------------------------------------
+	 * THE DANGLING-INPUT SWEEP — the defects a clean compile cannot see.
+	 *
+	 * An unlinked object/struct input is LEGAL Blueprint: Array_Add with no NewItem appends null,
+	 * IsValid with no InputObject is constant-false, a Create Widget payload pin left empty spawns a
+	 * row with no data, a variable Set with no value writes the type default. Every one of those
+	 * shipped on this project behind an E=0 W=0 compile — rows that never joined their list, a Join
+	 * button that could never enable, screens that read as done and were dead.
+	 *
+	 * So the compile endpoint itself now names them, in `dangling`, on every call. It deliberately
+	 * does NOT fail the compile — an empty payload pin can be intentional — but it can never again
+	 * be invisible. Ignored: exec pins, self/context/tolerance-style pins that default empty by
+	 * design, bool/number pins (a 0/false default is almost always meant), and Make-struct array
+	 * inputs (an empty array on a Make node is "none yet", which is correct).
+	 * ---------------------------------------------------------------------------------------- */
+	TArray<FString> Dangling;
+	{
+		static const TSet<FName> IgnoredPins = {
+			TEXT("self"), TEXT("WorldContextObject"), TEXT("OutputDelegate"), TEXT("Class"),
+			TEXT("OwningPlayer"), TEXT("ErrorTolerance"), TEXT("InTimeZone"), TEXT("Dimension 1") };
+
+		TArray<UEdGraph*> AllGraphs;
+		BP->GetAllGraphs(AllGraphs);
+		for (UEdGraph* Graph : AllGraphs)
+		{
+			if (!Graph) { continue; }
+			for (UEdGraphNode* Node : Graph->Nodes)
+			{
+				if (!Node) { continue; }
+				const bool bCreateWidget =
+					Node->GetClass()->GetName().Contains(TEXT("CreateWidget"));
+				for (UEdGraphPin* P : Node->Pins)
+				{
+					if (!P || P->Direction != EGPD_Input) { continue; }
+					if (P->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec) { continue; }
+					if (P->LinkedTo.Num() > 0) { continue; }
+					if (IgnoredPins.Contains(P->PinName)) { continue; }
+
+					const FName Cat = P->PinType.PinCategory;
+					const bool bRiskyType =
+						Cat == UEdGraphSchema_K2::PC_Object || Cat == UEdGraphSchema_K2::PC_Interface
+						|| Cat == UEdGraphSchema_K2::PC_Struct || P->PinType.IsArray()
+						|| Cat == UEdGraphSchema_K2::PC_Wildcard;
+					// On a Create Widget node EVERY empty ExposeOnSpawn pin is worth naming — a
+					// string payload left blank is as blank as an object one.
+					if (!bCreateWidget && !bRiskyType) { continue; }
+					if (Node->IsA<UK2Node_MakeStruct>() && P->PinType.IsArray()) { continue; }
+
+					const FString Def = P->DefaultObject
+						? P->DefaultObject->GetName() : P->DefaultValue;
+					if (!Def.IsEmpty() && Def != TEXT("None")
+						&& Def != TEXT("0") && Def != TEXT("false") && Def != TEXT("False"))
+					{
+						continue;   // an authored literal is a real value
+					}
+
+					Dangling.Add(FString::Printf(TEXT("%s: '%s' on %s has no link and no value"),
+						*Graph->GetName(), *P->PinName.ToString(),
+						*Node->GetNodeTitle(ENodeTitleType::ListView).ToString()));
+				}
+			}
+		}
+	}
+
 	FJObj O = NewObj();
 	const bool bOk = (Results.NumErrors == 0) && (BP->Status != BS_Error);
 	O->SetBoolField(TEXT("ok"), bOk);
 	O->SetNumberField(TEXT("num_errors"), Results.NumErrors);
 	O->SetNumberField(TEXT("num_warnings"), Results.NumWarnings);
+	O->SetNumberField(TEXT("num_dangling"), Dangling.Num());
 	SetStrArray(O, TEXT("errors"), Errors);
 	SetStrArray(O, TEXT("warnings"), Warnings);
+	SetStrArray(O, TEXT("dangling"), Dangling);
 	switch (BP->Status)
 	{
 	case BS_UpToDate:             O->SetStringField(TEXT("status"), TEXT("UpToDate")); break;

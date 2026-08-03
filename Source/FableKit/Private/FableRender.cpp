@@ -1,8 +1,10 @@
 #include "FableRender.h"
 
 #include "Blueprint/UserWidget.h"
+#include "Blueprint/WidgetTree.h"
 #include "WidgetBlueprint.h"
 #include "Components/Widget.h"
+#include "Components/PanelWidget.h"
 #include "Slate/WidgetRenderer.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Rendering/SlateRenderer.h"
@@ -21,8 +23,11 @@
 #include "Editor.h"
 
 // RenderMesh: a throwaway preview world + a scene capture, so nothing is ever spawned into the level
-// the user has open.
+// the user has open. Live-mode widget renders reuse the same idea: their throwaway world hosts the
+// minimal player chain UUserWidget::Initialize demands before it will run NativeOnInitialized.
 #include "PreviewScene.h"
+#include "GameFramework/PlayerController.h"
+#include "Engine/LocalPlayer.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Components/DirectionalLightComponent.h"
@@ -166,6 +171,123 @@ namespace FableRenderPrivate
 		return NewObject<UWorld>();
 	}
 
+	/**
+	 * The "live" widget lifecycle needs a PLAYER CONTEXT: UUserWidget::Initialize only calls
+	 * NativeOnInitialized when PlayerContext.IsValid() (UserWidget.cpp — the backward-compat gate),
+	 * and IsValid demands the whole chain: a ULocalPlayer, a world, a PlayerController resolvable
+	 * from the pair, and that controller's ->Player set. Without it, "live" ran NativeConstruct but
+	 * silently skipped NativeOnInitialized — which is where this project's screens compose.
+	 *
+	 * Build the minimum of that chain in a THROWAWAY preview world (never the user's level — same
+	 * isolation RenderMesh uses). The controller is a bare engine APlayerController with a default
+	 * APlayerState; game code reading GetPS()/GetGS()/GetGameInstance() gets null and must guard,
+	 * which the project's screens do. Destroyed with the scene when the call returns.
+	 */
+	struct FWrLivePlayerChain
+	{
+		TUniquePtr<FPreviewScene> Scene;
+		APlayerController* PC = nullptr;
+		ULocalPlayer* LP = nullptr;
+
+		bool Build()
+		{
+			Scene = MakeUnique<FPreviewScene>(FPreviewScene::ConstructionValues()
+				.SetCreatePhysicsScene(false)
+				.SetTransactional(false));
+			UWorld* World = Scene ? Scene->GetWorld() : nullptr;
+			if (!World) { return false; }
+
+			FActorSpawnParameters SpawnParams;
+			SpawnParams.ObjectFlags |= RF_Transient;
+			SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+			PC = World->SpawnActor<APlayerController>(SpawnParams);
+			// The engine base class on purpose, not GEngine->LocalPlayerClass: a game-specific local
+			// player may assume a viewport client this world does not have. Widget code that casts to
+			// the game's class gets null and guards, same as every other absent-game-state read here.
+			LP = NewObject<ULocalPlayer>(GEngine, ULocalPlayer::StaticClass(), NAME_None, RF_Transient);
+			if (!PC || !LP) { return false; }
+			PC->Player = LP;
+			LP->PlayerController = PC;
+			return true;
+		}
+		UWorld* GetWorld() const { return Scene ? Scene->GetWorld() : nullptr; }
+	};
+
+	/**
+	 * Invoke one scripted call from the "calls" option on the widget: ["FuncName", arg, arg...].
+	 * Args fill the UFunction's parameters POSITIONALLY; supported parameter types are the scalar
+	 * set a state-driving call actually needs (bool / ints / float / double / FString / FName /
+	 * FText / enum bytes). Anything else refuses loudly — a silently skipped call would make a
+	 * conformance render lie, which is the exact failure class this option exists to kill.
+	 */
+	static bool WrInvokeScriptedCall(UUserWidget* Widget, const TArray<TSharedPtr<FJsonValue>>& Call, FString& OutErr)
+	{
+		if (Call.Num() < 1 || !Call[0].IsValid())
+		{
+			OutErr = TEXT("calls: each entry must be a non-empty array starting with the function name");
+			return false;
+		}
+		const FString FuncName = Call[0]->AsString();
+		UFunction* Func = Widget->FindFunction(FName(*FuncName));
+		if (!Func)
+		{
+			OutErr = FString::Printf(TEXT("calls: %s has no function named '%s'"),
+				*Widget->GetClass()->GetName(), *FuncName);
+			return false;
+		}
+
+		TArray<uint8> Parms;
+		Parms.SetNumZeroed(FMath::Max<int32>(Func->ParmsSize, 1));
+		// Two passes around the fill: FText/FString parameters have real constructors, and a
+		// memzeroed block is not a constructed value.
+		for (TFieldIterator<FProperty> It(Func); It && It->HasAnyPropertyFlags(CPF_Parm); ++It)
+		{
+			It->InitializeValue_InContainer(Parms.GetData());
+		}
+
+		bool bOk = true;
+		int32 ArgIndex = 1;
+		for (TFieldIterator<FProperty> It(Func); It && It->HasAnyPropertyFlags(CPF_Parm); ++It)
+		{
+			if (It->HasAnyPropertyFlags(CPF_ReturnParm)) { continue; }
+			if (ArgIndex >= Call.Num()) { break; }   // unsupplied params keep their default-initialised value
+			const TSharedPtr<FJsonValue>& Arg = Call[ArgIndex++];
+			if (!Arg.IsValid()) { continue; }
+
+			if (FBoolProperty* BP = CastField<FBoolProperty>(*It))        { BP->SetPropertyValue_InContainer(Parms.GetData(), Arg->AsBool()); }
+			else if (FFloatProperty* FP = CastField<FFloatProperty>(*It)) { FP->SetPropertyValue_InContainer(Parms.GetData(), static_cast<float>(Arg->AsNumber())); }
+			else if (FDoubleProperty* DP = CastField<FDoubleProperty>(*It)) { DP->SetPropertyValue_InContainer(Parms.GetData(), Arg->AsNumber()); }
+			else if (FIntProperty* IP = CastField<FIntProperty>(*It))     { IP->SetPropertyValue_InContainer(Parms.GetData(), static_cast<int32>(Arg->AsNumber())); }
+			else if (FInt64Property* I64 = CastField<FInt64Property>(*It)) { I64->SetPropertyValue_InContainer(Parms.GetData(), static_cast<int64>(Arg->AsNumber())); }
+			else if (FByteProperty* BY = CastField<FByteProperty>(*It))   { BY->SetPropertyValue_InContainer(Parms.GetData(), static_cast<uint8>(Arg->AsNumber())); }
+			else if (FEnumProperty* EP = CastField<FEnumProperty>(*It))
+			{
+				EP->GetUnderlyingProperty()->SetIntPropertyValue(
+					EP->ContainerPtrToValuePtr<void>(Parms.GetData()), static_cast<int64>(Arg->AsNumber()));
+			}
+			else if (FStrProperty* SP = CastField<FStrProperty>(*It))     { SP->SetPropertyValue_InContainer(Parms.GetData(), Arg->AsString()); }
+			else if (FNameProperty* NP = CastField<FNameProperty>(*It))   { NP->SetPropertyValue_InContainer(Parms.GetData(), FName(*Arg->AsString())); }
+			else if (FTextProperty* TP = CastField<FTextProperty>(*It))   { TP->SetPropertyValue_InContainer(Parms.GetData(), FText::FromString(Arg->AsString())); }
+			else
+			{
+				OutErr = FString::Printf(TEXT("calls: %s parameter '%s' is a %s — unsupported for scripted calls"),
+					*FuncName, *It->GetName(), *It->GetClass()->GetName());
+				bOk = false;
+				break;
+			}
+		}
+
+		if (bOk)
+		{
+			Widget->ProcessEvent(Func, Parms.GetData());
+		}
+		for (TFieldIterator<FProperty> It(Func); It && It->HasAnyPropertyFlags(CPF_Parm); ++It)
+		{
+			It->DestroyValue_InContainer(Parms.GetData());
+		}
+		return bOk;
+	}
+
 	/** Shared PNG write-out: delete first, export, report the byte count. Returns the resolved path. */
 	static FString WrExportPng(UWorld* World, UTextureRenderTarget2D* RT, const FString& OutPngPath, int64& OutBytes)
 	{
@@ -216,6 +338,8 @@ FString UFableRender::RenderWidget(const FString& BlueprintPath, const FString& 
 	FLinearColor Background(0.02f, 0.02f, 0.025f, 1.0f);
 	float Scale = 1.0f;
 	bool bPreConstruct = true;
+	bool bLive = false;
+	TArray<TSharedPtr<FJsonValue>> ScriptedCalls;
 
 	if (!OptionsJson.IsEmpty() && OptionsJson != TEXT("{}"))
 	{
@@ -237,6 +361,9 @@ FString UFableRender::RenderWidget(const FString& BlueprintPath, const FString& 
 
 		bool bOpt = false;
 		if (Opts->TryGetBoolField(TEXT("pre_construct"), bOpt)) { bPreConstruct = bOpt; }
+		if (Opts->TryGetBoolField(TEXT("live"), bOpt))          { bLive = bOpt; }
+		const TArray<TSharedPtr<FJsonValue>>* CallsArr = nullptr;
+		if (Opts->TryGetArrayField(TEXT("calls"), CallsArr) && CallsArr) { ScriptedCalls = *CallsArr; }
 	}
 
 	if (Scale <= 0.0f || Scale > 8.0f)
@@ -263,8 +390,22 @@ FString UFableRender::RenderWidget(const FString& BlueprintPath, const FString& 
 
 	/* ---------------- construct the widget ---------------- */
 
+	// Declared before the widget guard on purpose: locals destroy in reverse order, so the preview
+	// world (the widget's outer in live mode) outlives the widget's strong ref.
+	FWrLivePlayerChain LiveChain;
+	bool bLivePlayer = false;
+
 	bool bTransientWorld = false;
-	UWorld* World = WrPickWorld(bTransientWorld);
+	UWorld* World = nullptr;
+	if (bLive && LiveChain.Build())
+	{
+		World = LiveChain.GetWorld();
+		bLivePlayer = true;
+	}
+	if (!World)
+	{
+		World = WrPickWorld(bTransientWorld);
+	}
 	if (!World)
 	{
 		return Err(TEXT("No world available to outer the widget to (no editor world, no GWorld, and a transient world could not be created)."));
@@ -281,21 +422,58 @@ FString UFableRender::RenderWidget(const FString& BlueprintPath, const FString& 
 	// accumulates across repeated calls.
 	TStrongObjectPtr<UUserWidget> WidgetGuard(Widget);
 
+	if (bLivePlayer)
+	{
+		// What unlocks NativeOnInitialized inside Initialize() — see FWrLivePlayerChain.
+		Widget->SetPlayerContext(FLocalPlayerContext(LiveChain.LP, World));
+	}
+
 #if WITH_EDITOR
-	// THE safety mechanism, and the reason a widget that null-derefs its PlayerController in
-	// NativeConstruct cannot take the editor down here: with Designing set, IsDesignTime() is true, so
-	// UWidget::OnWidgetRebuilt takes its design-time branch and never calls NativeConstruct — and
-	// UUserWidget::Initialize likewise never calls NativeOnInitialized. Same flag pairing as the
-	// engine's own UWidgetBlueprintThumbnailRenderer.
-	EWidgetDesignFlags DesignFlags = EWidgetDesignFlags::Designing;
-	if (bPreConstruct) { DesignFlags |= EWidgetDesignFlags::ExecutePreConstruct; }
-	Widget->SetDesignerFlags(DesignFlags);
+	/* THE safety mechanism, and the reason a widget that null-derefs its PlayerController in
+	 * NativeConstruct cannot take the editor down here: with Designing set, IsDesignTime() is true, so
+	 * UWidget::OnWidgetRebuilt takes its design-time branch and never calls NativeConstruct — and
+	 * UUserWidget::Initialize likewise never calls NativeOnInitialized. Same flag pairing as the
+	 * engine's own UWidgetBlueprintThumbnailRenderer.
+	 *
+	 * "live" OPTS OUT of that safety, deliberately: this project's screens COMPOSE THEIR LAYOUT in
+	 * NativeOnInitialized (the chest, the NPC menu, the achievements chrome, the bestiary rebuild),
+	 * so a Designing render shows only the raw authored asset — useless for conformance. With no
+	 * designer flags the widget takes the real runtime path (NativeOnInitialized at Initialize;
+	 * NativePreConstruct + NativeConstruct from OnWidgetRebuilt inside TakeWidget). The trade is
+	 * real: game code runs with NO owning player, so a widget that hard-derefs GetOwningPlayer()/
+	 * PlayerState CAN take the editor down. Per-call opt-in; null-guarded widgets only. */
+	if (!bLive)
+	{
+		EWidgetDesignFlags DesignFlags = EWidgetDesignFlags::Designing;
+		if (bPreConstruct) { DesignFlags |= EWidgetDesignFlags::ExecutePreConstruct; }
+		Widget->SetDesignerFlags(DesignFlags);
+	}
 #endif
 
 	Widget->Initialize();
 
 	// TakeWidget builds the Slate tree (RebuildWidget + SynchronizeProperties + OnWidgetRebuilt).
 	TSharedRef<SWidget> SlateWidget = Widget->TakeWidget();
+
+	/* ---------------- scripted state ("calls") ----------------
+	 * Drive the widget into the STATE being verified — a search filter, a selected category, a
+	 * service page — after the full lifecycle, before the draw. A failed call fails the render:
+	 * a conformance image of the wrong state is worse than no image. */
+	int32 CallsRun = 0;
+	for (const TSharedPtr<FJsonValue>& CallValue : ScriptedCalls)
+	{
+		const TArray<TSharedPtr<FJsonValue>>* CallArr = nullptr;
+		if (!CallValue.IsValid() || !CallValue->TryGetArray(CallArr) || !CallArr)
+		{
+			return Err(TEXT("calls: every entry must be an array like [\"SetSearchFilter\", \"fps\"]."));
+		}
+		FString CallErr;
+		if (!WrInvokeScriptedCall(Widget, *CallArr, CallErr))
+		{
+			return Err(CallErr);
+		}
+		++CallsRun;
+	}
 
 	/* ---------------- size ---------------- */
 
@@ -398,9 +576,131 @@ FString UFableRender::RenderWidget(const FString& BlueprintPath, const FString& 
 	Out->SetNumberField(TEXT("desired_h"), Desired.Y);
 	Out->SetStringField(TEXT("background"), Background.ToString());
 	Out->SetBoolField(TEXT("pre_construct"), bPreConstruct);
+	Out->SetBoolField(TEXT("live"), bLive);
+	Out->SetBoolField(TEXT("live_player"), bLivePlayer);
+	Out->SetNumberField(TEXT("calls_run"), CallsRun);
 	Out->SetBoolField(TEXT("transient_world"), bTransientWorld);
 	Out->SetNumberField(TEXT("bytes"), static_cast<double>(Bytes));
 	return ToJson(Out);
+}
+
+FString UFableRender::MeasureWidget(const FString& BlueprintPath, int32 Width, int32 Height, const FString& OptionsJson)
+{
+	if (!IsInGameThread())
+	{
+		return Err(TEXT("MeasureWidget must run on the game thread."));
+	}
+	if (!FSlateApplication::IsInitialized())
+	{
+		return Err(TEXT("Slate is not initialised - measuring needs a live editor (not a commandlet, not -nullrhi)."));
+	}
+
+	float Scale = 1.0f;
+	bool bPreConstruct = true;
+	bool bLive = false;
+	if (!OptionsJson.IsEmpty() && OptionsJson != TEXT("{}"))
+	{
+		FJObj Opts;
+		if (!FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(OptionsJson), Opts) || !Opts.IsValid())
+		{
+			return Err(TEXT("OptionsJson is not a JSON object."));
+		}
+		double ScaleNum = 0.0;
+		if (Opts->TryGetNumberField(TEXT("scale"), ScaleNum)) { Scale = static_cast<float>(ScaleNum); }
+		bool bOpt = false;
+		if (Opts->TryGetBoolField(TEXT("pre_construct"), bOpt)) { bPreConstruct = bOpt; }
+		if (Opts->TryGetBoolField(TEXT("live"), bOpt))          { bLive = bOpt; }
+	}
+	if (Scale <= 0.0f || Scale > 8.0f)
+	{
+		return Err(FString::Printf(TEXT("scale must be > 0 and <= 8 (got %f)."), Scale));
+	}
+
+	FString LoadErr, ResolvedPath;
+	UClass* WidgetClass = WrResolveWidgetClass(BlueprintPath, LoadErr, ResolvedPath);
+	if (!WidgetClass) { return Err(LoadErr); }
+	if (!WidgetClass->IsChildOf(UUserWidget::StaticClass()))
+	{
+		return Err(FString::Printf(TEXT("%s is not a UUserWidget class."), *ResolvedPath));
+	}
+	if (WidgetClass->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists))
+	{
+		return Err(FString::Printf(TEXT("%s cannot be instantiated (abstract/deprecated/stale REINST_)."), *ResolvedPath));
+	}
+
+	FWrLivePlayerChain LiveChain;
+	bool bLivePlayer = false;
+	bool bTransientWorld = false;
+	UWorld* World = nullptr;
+	if (bLive && LiveChain.Build())
+	{
+		World = LiveChain.GetWorld();
+		bLivePlayer = true;
+	}
+	if (!World) { World = WrPickWorld(bTransientWorld); }
+	if (!World) { return Err(TEXT("No world available to outer the widget to.")); }
+	TStrongObjectPtr<UWorld> TransientWorldGuard(bTransientWorld ? World : nullptr);
+
+	UUserWidget* Widget = NewObject<UUserWidget>(World, WidgetClass, NAME_None, RF_Transient);
+	if (!Widget) { return Err(FString::Printf(TEXT("NewObject failed for %s."), *ResolvedPath)); }
+	TStrongObjectPtr<UUserWidget> WidgetGuard(Widget);
+	if (bLivePlayer)
+	{
+		Widget->SetPlayerContext(FLocalPlayerContext(LiveChain.LP, World));
+	}
+
+#if WITH_EDITOR
+	// Same "live" contract as RenderWidget: measuring a runtime-composed screen needs the runtime
+	// lifecycle, or the tree being measured is the raw authored asset rather than what ships.
+	if (!bLive)
+	{
+		EWidgetDesignFlags DesignFlags = EWidgetDesignFlags::Designing;
+		if (bPreConstruct) { DesignFlags |= EWidgetDesignFlags::ExecutePreConstruct; }
+		Widget->SetDesignerFlags(DesignFlags);
+	}
+#endif
+	Widget->Initialize();
+
+	TSharedRef<SWidget> SlateWidget = Widget->TakeWidget();
+
+	/* A prepass is what fills in every widget's desired size, which is the number that answers "why is
+	 * this panel 305 tall". Width/Height are accepted for symmetry with RenderWidget but do not
+	 * constrain the measure: desired size is by definition the UNCONSTRAINED ask, and that is exactly
+	 * the question being asked when hunting an unexpected height. */
+	SlateWidget->SlatePrepass(Scale);
+	const FVector2D RootDesired = SlateWidget->GetDesiredSize();
+
+	TArray<FJVal> Rows;
+	if (Widget->WidgetTree)
+	{
+		Widget->WidgetTree->ForEachWidget([&Rows](UWidget* Ch)
+		{
+			if (!Ch) { return; }
+			FJObj Row = NewObj();
+			Row->SetStringField(TEXT("name"), Ch->GetName());
+			Row->SetStringField(TEXT("class"), Ch->GetClass()->GetName());
+			Row->SetStringField(TEXT("parent"), Ch->GetParent() ? Ch->GetParent()->GetName() : TEXT(""));
+
+			// GetCachedWidget is the Slate widget this UWidget built during TakeWidget.
+			TSharedPtr<SWidget> S = Ch->GetCachedWidget();
+			const FVector2D D = S.IsValid() ? S->GetDesiredSize() : FVector2D::ZeroVector;
+			Row->SetNumberField(TEXT("desired_w"), D.X);
+			Row->SetNumberField(TEXT("desired_h"), D.Y);
+			Row->SetBoolField(TEXT("built"), S.IsValid());
+			Rows.Add(MakeShared<FJsonValueObject>(Row));
+		});
+	}
+
+	FJObj O = NewObj();
+	O->SetBoolField(TEXT("ok"), true);
+	O->SetStringField(TEXT("widget"), ResolvedPath);
+	O->SetNumberField(TEXT("root_w"), RootDesired.X);
+	O->SetNumberField(TEXT("root_h"), RootDesired.Y);
+	O->SetNumberField(TEXT("scale"), Scale);
+	O->SetBoolField(TEXT("live"), bLive);
+	O->SetBoolField(TEXT("live_player"), bLivePlayer);
+	O->SetArrayField(TEXT("widgets"), Rows);
+	return ToJson(O);
 }
 
 FString UFableRender::RenderMesh(const FString& AssetPath, const FString& OutPngPath, int32 Width, int32 Height, const FString& OptionsJson)

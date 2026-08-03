@@ -444,6 +444,17 @@ FString UFableNiagara::AddEmitter(const FString& SystemPath, const FString& Sour
 	{
 		if (H.GetId() == NewHandleId)
 		{
+			/* Deliria local patch (2026-08-02): sever inheritance to the donor. AddEmitterToSystem's
+			 * copy keeps Parent = the source emitter, and when the source lives INSIDE another
+			 * system's package that is a cross-package private-object reference — the composed system
+			 * can then NEVER SAVE ("Illegal reference to private object ...:Spots_5"). The contract
+			 * here is copy-and-own (the comment above already promises "owned by this system"), so
+			 * drop the parent link on the fresh copy. Never triggered by the original smoke test
+			 * because that test discarded its scratch system without saving. */
+			if (FVersionedNiagaraEmitterData* NewData = H.GetEmitterData())
+			{
+				NewData->RemoveParent();
+			}
 			if (!NewEmitterName.IsEmpty()) { H.SetName(FName(*NewEmitterName), *Sys); }
 			FinalName = H.GetName().ToString();
 		}

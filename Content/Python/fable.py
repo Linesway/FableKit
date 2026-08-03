@@ -249,6 +249,16 @@ def wt_remove(bp_path, name):
     return j(unreal.FableBP.wt_remove_widget(_norm(bp_path), name))
 
 
+def wt_reparent(bp_path, name, new_parent, index=-1):
+    """Move a widget (and its subtree) under a different parent. index -1 appends.
+
+    The UWidget OBJECT is reused, so authored properties (fonts, brushes, tints, template variables)
+    survive the move. The layout SLOT is rebuilt from scratch — re-apply wt_slot afterwards.
+    Refuses on the root, self-parenting, cycles, and an occupied single-content parent.
+    """
+    return j(unreal.FableBP.wt_reparent_widget(_norm(bp_path), name, new_parent, int(index)))
+
+
 def wt_set(bp_path, name, **props):
     """Set widget properties. Values are UE ImportText strings — T3D struct literals work verbatim."""
     import json as _json
@@ -259,6 +269,48 @@ def wt_slot(bp_path, name, **props):
     """Set layout-slot properties (Padding/HorizontalAlignment/Size...)."""
     import json as _json
     return j(unreal.FableBP.wt_set_slot_props(_norm(bp_path), name, _json.dumps(props)))
+
+
+def wt_get(bp_path, name, props=""):
+    """READ a widget's properties, in the same text form wt_set takes.
+
+    props "" dumps everything; otherwise a comma-separated list of names (internal OR authored, so
+    Blueprint variables like "In Font Info" work). Use this to COPY a value off an authored widget
+    onto a new one rather than guessing — a fresh template instance does NOT match its siblings.
+
+        v = fable.wt_get(BP, 'SinglePlayer', 'In Font Info')['props']['In Font Info']
+        fable.wt_set(BP, 'Achievements', **{'In Font Info': v})
+    """
+    if isinstance(props, (list, tuple)):
+        props = ",".join(props)
+    return j(unreal.FableBP.wt_get_props(_norm(bp_path), name, props))
+
+
+def measure_widget(bp_path, width=0, height=0, scale=None, pre_construct=None):
+    """Desired size of the root AND of every widget in the tree.
+
+    A render tells you a panel is too tall; this tells you WHICH CHILD is forcing it. Sort by
+    desired_h and read the top. Same design-time construction as render_widget.
+    """
+    import json as _json
+    opts = {}
+    if scale is not None:
+        opts["scale"] = float(scale)
+    if pre_construct is not None:
+        opts["pre_construct"] = bool(pre_construct)
+    return j(unreal.FableRender.measure_widget(_norm(bp_path), int(width), int(height),
+                                               _json.dumps(opts) if opts else ""))
+
+
+def tallest(bp_path, top=12):
+    """measure_widget, sorted by height — the one-liner for 'why is this thing so tall'."""
+    r = measure_widget(bp_path)
+    rows = sorted(r["widgets"], key=lambda w: -w["desired_h"])[:top]
+    print("root %.0f x %.0f" % (r["root_w"], r["root_h"]))
+    for w in rows:
+        print("  %7.1f x %7.1f  %-30s %-26s <- %s"
+              % (w["desired_w"], w["desired_h"], w["name"], w["class"], w["parent"]))
+    return rows
 
 
 # ---------------------------------------------------------------- offscreen render
@@ -297,6 +349,101 @@ def render_widget(bp_path, out_png, width=0, height=0,
         _json.dumps(opts) if opts else ""))
     print("rendered %s -> %s (%dx%d)" % (bp_path, res["png"], res["width"], res["height"]))
     return res
+
+
+def render_live(bp_path, out_png, width=1920, height=1080, calls=None, background=None, scale=None):
+    """Render with the REAL widget lifecycle (NativeOnInitialized + NativeConstruct) — the way to
+    see RUNTIME-COMPOSED screens (chest, NPC menu, achievements, Index of the Eye) as they ship.
+
+        fable.render_live('/Game/UI/...WGBP_Options', r'C:/tmp/opt_search.png',
+                          calls=[["SetSearchFilter", "fps"]])
+
+    calls  list of ["FunctionName", arg, ...] invoked on the widget after construction, before the
+           draw — puts the widget into the STATE being verified. A failed call fails the render.
+
+    CAVEATS: game code runs with no game state — null-guarded widgets only; counts/data read as
+    empty; icon textures may render as checkers in the preview world. Judge LAYOUT.
+    """
+    import json as _json
+    opts = {"live": True}
+    if background is not None:
+        opts["background"] = str(background)
+    if scale is not None:
+        opts["scale"] = float(scale)
+    if calls:
+        opts["calls"] = list(calls)
+    res = j(unreal.FableRender.render_widget(
+        _norm(bp_path), out_png, int(width), int(height), _json.dumps(opts)))
+    print("live-rendered %s -> %s (calls_run=%s)" % (bp_path, res["png"], res.get("calls_run", 0)))
+    return res
+
+
+def conform(bp_path, target_png, out_png, width=0, height=0, calls=None, diff_png=None):
+    """Live-render bp_path and DIFF it against a target mock. Returns (mismatch_pct, reply_dict).
+
+        pct, res = fable.conform('/Game/UI/...WGBP_Achievements',
+                                 r'...TARGET_menu_achievements.png', r'...AFTER_ach.png')
+
+    Renders at the TARGET image's size unless width/height are given, computes mean absolute
+    per-pixel difference as a percentage, and (optionally) writes a heat overlay to diff_png.
+    "Matches the design" becomes a NUMBER — claims without one are opinions.
+    Requires PIL on the editor's python (falls back to size-only comparison without it).
+    """
+    from PIL import Image  # noqa: available in the editor python env used for mockups
+    tgt = Image.open(target_png).convert("RGB")
+    w = int(width) or tgt.width
+    h = int(height) or tgt.height
+    res = render_live(bp_path, out_png, w, h, calls=calls)
+    got = Image.open(res["png"]).convert("RGB").resize(tgt.size)
+    try:
+        from PIL import ImageChops
+        diff = ImageChops.difference(got, tgt)
+        stat_sum = 0
+        hist = diff.histogram()
+        # mean abs diff over 3 channels
+        total = 0
+        for band in range(3):
+            for value in range(256):
+                count = hist[band * 256 + value]
+                total += count
+                stat_sum += count * value
+        pct = 100.0 * stat_sum / max(total * 255.0, 1.0)
+        if diff_png:
+            diff.point(lambda v: min(255, v * 4)).save(diff_png)
+    except Exception as e:  # pragma: no cover
+        print("conform: diff failed (%s) — size-only check" % e)
+        pct = -1.0
+    print("conform %s vs %s -> %.2f%% mean pixel mismatch" % (bp_path, target_png, pct))
+    return pct, res
+
+
+def assert_tree(bp_path, spec, live=True, calls=None):
+    """Assert named widgets EXIST (and optionally their class) in a widget's built tree.
+
+        fable.assert_tree('/Game/UI/...WGBP_Achievements',
+                          {"DetailStrip": None, "RailHost": "VerticalBox"})
+
+    spec  {name_substring: class_substring_or_None}. Uses measure_widget (live by default, so
+    runtime-composed trees are the ones asserted). Raises AssertionError listing every miss —
+    structural regressions fail LOUDLY instead of shipping as a quietly wrong screen.
+    """
+    import json as _json
+    opts = {"live": bool(live)}
+    if calls:
+        opts["calls"] = list(calls)
+    res = j(unreal.FableRender.measure_widget(_norm(bp_path), 1920, 1080, _json.dumps(opts)))
+    widgets = res.get("widgets", [])
+    misses = []
+    for name_part, class_part in dict(spec).items():
+        found = [w for w in widgets if name_part.lower() in str(w.get("name", "")).lower()]
+        if class_part is not None:
+            found = [w for w in found if class_part.lower() in str(w.get("class", "")).lower()]
+        if not found:
+            misses.append("%s (%s)" % (name_part, class_part or "any class"))
+    if misses:
+        raise AssertionError("assert_tree(%s): MISSING %s" % (bp_path, ", ".join(misses)))
+    print("assert_tree %s: all %d present" % (bp_path, len(spec)))
+    return True
 
 
 def render_mesh(mesh_path, out_png, width=1024, height=1024, yaw=None, pitch=None, roll=None,
@@ -338,6 +485,25 @@ def clear_dead_bindings(bp_path):
     return j(unreal.FableBP.clear_dead_bindings(_norm(bp_path)))
 
 
+def bound_event(bp_path, graph, component, delegate, x=0.0, y=0.0):
+    """The red 'On Clicked (MyButton)' node — bind a delegate declared on a CHILD widget/component.
+
+    This is what wires an authored-but-inert button. `add_dispatcher_bind` cannot do it: that one is
+    self-context only, so it reaches dispatchers on THIS blueprint and nothing else. And it cannot be
+    done from Python at all — UK2Node_ComponentBoundEvent's DelegatePropertyName /
+    ComponentPropertyName are bare UPROPERTY() with no CPF_Edit|CPF_BlueprintVisible, which
+    set_editor_property refuses outright. Hence the native call.
+
+    Idempotent: an existing bound event for the same (component, delegate) comes back with
+    existing=True instead of a duplicate.
+
+        n = fable.bound_event(BP, 'EventGraph', 'NewCharacterButton', 'OnClicked', -900, 2600)
+        fable.BP.connect_pins(BP, 'EventGraph', n['node']['id'], 'then', callnode, 'execute')
+    """
+    return j(BP.add_component_bound_event(_norm(bp_path), graph, component, delegate,
+                                          float(x), float(y)))
+
+
 def compile_bp(bp_path):
     res = json.loads(BP.compile_bp(bp_path))
     print(json.dumps(res, indent=1))
@@ -366,3 +532,83 @@ def dump(bp_path, graph="", out=None, filter=""):
 
 def info(bp_path):
     show(BP.dump_blueprint(bp_path))
+
+
+# ============================ UI TOOLSET (companion-hosting era) ============================
+def _widget_slot_info(w):
+    out = {}
+    sl = w.slot if hasattr(w, "slot") else None
+    if sl:
+        out["slot_class"] = sl.get_class().get_name()
+        for prop in ("padding", "size", "horizontal_alignment", "vertical_alignment", "z_order", "layout_data"):
+            try: out[prop] = str(sl.get_editor_property(prop))
+            except Exception: pass
+    return out
+
+def dump_tree(asset_path_or_class, live=False, out_path=None):
+    """Recursive widget tree: class, visibility, slot props and (live) absolute geometry."""
+    import unreal, json
+    lines = []
+    def walk(w, depth):
+        if not w: return
+        info = {"name": w.get_name(), "class": w.get_class().get_name()}
+        try: info["visible"] = str(w.get_editor_property("visibility"))
+        except Exception: pass
+        info.update(_widget_slot_info(w))
+        try:
+            geo = w.get_cached_geometry()
+            ap = unreal.SlateBlueprintLibrary.get_absolute_size(geo)
+            tl = unreal.SlateBlueprintLibrary.local_to_absolute(geo, unreal.Vector2D(0, 0))
+            info["abs_pos"] = (round(tl.x, 1), round(tl.y, 1)); info["abs_size"] = (round(ap.x, 1), round(ap.y, 1))
+        except Exception: pass
+        lines.append("  " * depth + json.dumps(info))
+        try:
+            if isinstance(w, unreal.PanelWidget):
+                for i in range(w.get_children_count()):
+                    walk(w.get_child_at(i), depth + 1)
+        except Exception: pass
+    if live:
+        world = unreal.UnrealEditorSubsystem().get_game_world() or unreal.UnrealEditorSubsystem().get_editor_world()
+        for w in unreal.WidgetBlueprintLibrary.get_all_widgets_of_class(world, unreal.UserWidget, False):
+            if str(asset_path_or_class).lower() in w.get_class().get_name().lower():
+                try: root = w.get_editor_property("widget_tree").get_editor_property("root_widget")
+                except Exception: root = None
+                walk(root or w, 0)
+    else:
+        bp = unreal.load_asset(asset_path_or_class)
+        wt = bp.get_editor_property("widget_tree") if bp else None
+        root = wt.get_editor_property("root_widget") if wt else None
+        walk(root, 0)
+    text = chr(10).join(lines) if lines else "(no widgets matched)"
+    if out_path:
+        open(out_path, "w", encoding="utf-8").write(text)
+    print(text)
+    return text
+
+def find_widget(pattern, live=True):
+    """Live viewport widgets whose class/name matches pattern, with absolute rects."""
+    import unreal
+    world = unreal.UnrealEditorSubsystem().get_game_world() or unreal.UnrealEditorSubsystem().get_editor_world()
+    hits = []
+    for w in unreal.WidgetBlueprintLibrary.get_all_widgets_of_class(world, unreal.UserWidget, False):
+        n, c = w.get_name(), w.get_class().get_name()
+        if pattern.lower() in n.lower() or pattern.lower() in c.lower():
+            try:
+                geo = w.get_cached_geometry()
+                sz = unreal.SlateBlueprintLibrary.get_absolute_size(geo)
+                tl = unreal.SlateBlueprintLibrary.local_to_absolute(geo, unreal.Vector2D(0, 0))
+                hits.append((n, c, (round(tl.x, 1), round(tl.y, 1)), (round(sz.x, 1), round(sz.y, 1))))
+            except Exception:
+                hits.append((n, c, None, None))
+    for h in hits: print(h)
+    return hits
+
+def ui_screenshot(out_path, annotate=True):
+    """PIE screenshot; annotate writes a sibling .rects.txt with every live widget rect."""
+    import unreal
+    unreal.AutomationLibrary.take_high_res_screenshot(1920, 1080, out_path)
+    if annotate:
+        try: hits = find_widget("", live=True)
+        except Exception: hits = []
+        open(out_path + ".rects.txt", "w", encoding="utf-8").write(repr(hits))
+    print("screenshot queued -> " + out_path)

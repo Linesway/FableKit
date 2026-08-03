@@ -119,6 +119,17 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "FableKit")
 	static FString AddDispatcherBind(const FString& BlueprintPath, const FString& GraphName, const FString& DispatcherName, float X, float Y);
 
+	/** Add the red "On Clicked (MyButton)" event node that binds a delegate declared on a CHILD
+	 *  widget/component variable — the thing AddDispatcherBind cannot do, because that one only
+	 *  reaches dispatchers on THIS blueprint (bSelfContext).
+	 *
+	 *  This has to be C++: UK2Node_ComponentBoundEvent's DelegatePropertyName / DelegateOwnerClass /
+	 *  ComponentPropertyName are bare UPROPERTY() with no CPF_Edit | CPF_BlueprintVisible, and
+	 *  PropertyAccessUtil::CanSetPropertyValue refuses those outright — so AddNodeByClass +
+	 *  set_editor_property can never configure one from Python. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit")
+	static FString AddComponentBoundEvent(const FString& BlueprintPath, const FString& GraphName, const FString& ComponentName, const FString& DelegateName, float X, float Y);
+
 	/** Escape hatch: spawn any non-abstract UEdGraphNode subclass by class path. Post-configure its
 	 *  reflected properties from Python via unreal.find_object(<returned node path>) + set_editor_property,
 	 *  then ReconstructNode. */
@@ -186,14 +197,43 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "FableKit")
 	static FString WtRemoveWidget(const FString& BlueprintPath, const FString& WidgetName);
 
+	/** Move a widget (with its whole subtree) under a different parent, optionally at a given child
+	    index (-1 = append). The UWidget OBJECT is reused, so every authored property on it survives —
+	    only the layout SLOT is rebuilt, so re-apply slot padding/alignment afterwards.
+	    Refuses on the root, on self-parenting, on a cycle, and on a single-content parent that is
+	    already occupied. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit")
+	static FString WtReparentWidget(const FString& BlueprintPath, const FString& WidgetName, const FString& NewParentName, int32 Index = -1);
+
 	/** Set properties on a tree widget from JSON {"Prop": "UE text value", ...}. Values go through
 	    FProperty::ImportText, so struct literals in T3D syntax work verbatim (brushes, fonts, styles). */
 	UFUNCTION(BlueprintCallable, Category = "FableKit")
 	static FString WtSetProps(const FString& BlueprintPath, const FString& WidgetName, const FString& PropsJson);
 
+	/** READ a tree widget's properties back out, in the same text form WtSetProps takes.
+	    PropsCsv "" dumps everything; otherwise a comma-separated list of property names (either the
+	    internal name or the authored/display name — BP variables like "In Font Info" work).
+	    This is what lets you COPY a value off an authored widget onto a new one instead of guessing
+	    at it, which is the only reliable way to make a fresh template instance match its siblings. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit")
+	static FString WtGetProps(const FString& BlueprintPath, const FString& WidgetName, const FString& PropsCsv);
+
 	/** Same, on the widget's layout SLOT (padding/alignment/size rules). */
 	UFUNCTION(BlueprintCallable, Category = "FableKit")
 	static FString WtSetSlotProps(const FString& BlueprintPath, const FString& WidgetName, const FString& PropsJson);
+
+	/** List a Widget Blueprint's UMG animations by name. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit")
+	static FString WtListAnimations(const FString& BlueprintPath);
+
+	/** Delete a UMG animation. Empty AnimationName removes ALL of them.
+	 *
+	 *  WHY THIS IS NATIVE: UWidgetBlueprint::Animations is a PROTECTED UPROPERTY, so Python cannot read
+	 *  or write it ("Property 'Animations' ... is protected") — the same blind spot as WidgetTree. An
+	 *  animation whose tracks point at deleted widgets makes every compile emit "trying to animate a
+	 *  non-existent widget", which is otherwise unfixable from outside the editor UI. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit")
+	static FString WtRemoveAnimation(const FString& BlueprintPath, const FString& AnimationName);
 
 	/** Set a pin literal. Object/class pins take an object path; text pins set localized text; others take the literal string. */
 	UFUNCTION(BlueprintCallable, Category = "FableKit")
@@ -213,6 +253,80 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "FableKit")
 	static FString RemoveVariable(const FString& BlueprintPath, const FString& VarName);
+
+	/**
+	 * Change an EXISTING member variable's type in place.
+	 *
+	 * Needed whenever a Blueprint variable is declared against a class you are replacing — retyping
+	 * is the only way to keep the variable's identity (and therefore every Get/Set node's links)
+	 * while the type underneath it moves. Delegates to FBlueprintEditorUtils::ChangeMemberVariableType,
+	 * which retypes the pins on every node that touches the variable; links whose other end is no
+	 * longer type-compatible are dropped by the schema, so recompile and check before saving.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "FableKit")
+	static FString SetVariableType(const FString& BlueprintPath, const FString& VarName, const FString& Type);
+
+	/**
+	 * ReconstructNode, but DISCARDING stale pins instead of keeping them as orphans.
+	 *
+	 * A plain reconstruct preserves any pin the new signature no longer has, as long as it still
+	 * holds a link or a non-default value — that is the right default when a node is merely being
+	 * refreshed, and the wrong one after a deliberate class or type change, where the leftover pin
+	 * becomes a compile error ("In use pin 'X' no longer exists") or a warning ("Input pin 'X'
+	 * specifying non-default value no longer exists") describing something you meant to remove.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "FableKit")
+	static FString ReconstructNodePurgeOrphans(const FString& BlueprintPath, const FString& GraphName, const FString& NodeId);
+
+	/**
+	 * Repoint every Call Function node that targets OldClass at NewClass instead.
+	 *
+	 * The companion to SetVariableType when a class is being retired. Retyping the variables makes the
+	 * DATA flow to the new class, but each call node still resolves its function against the old one,
+	 * so its Target pin keeps the dead class's type and the graph fails with
+	 * "X Object Reference is not compatible with Y Object Reference" on a link you did not touch.
+	 * Only calls whose function actually exists on NewClass are moved; the rest are reported in
+	 * `skipped` rather than being silently broken.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "FableKit")
+	static FString RetargetFunctionCalls(const FString& BlueprintPath, const FString& OldClassPath, const FString& NewClassPath);
+
+	/**
+	 * Force a macro instance (For Each Loop, and friends) back to wildcard.
+	 *
+	 * UK2Node_MacroInstance caches what its wildcards resolved to in ResolvedWildcardType, and only
+	 * clears it via PostFixupAllWildcardPins once EVERY wildcard pin is unlinked. A For Each Loop
+	 * whose Array Element output still feeds something therefore keeps a dead class on its Array
+	 * input forever, and the schema refuses any new connection with "Array of X is not compatible
+	 * with Array of Y" — a link you cannot make and cannot see why.
+	 *
+	 * Breaks every link on the node, clears the cached type and reconstructs. THE CALLER MUST PUT THE
+	 * LINKS BACK, attaching the array input first so the element type propagates before anything
+	 * downstream is reattached.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "FableKit")
+	static FString ResetMacroWildcards(const FString& BlueprintPath, const FString& GraphName, const FString& NodeId);
+
+	/**
+	 * Repoint every variable Get/Set node that reads a member OF OldClass at NewClass instead.
+	 *
+	 * The variable counterpart to RetargetFunctionCalls. A "Get CurrentWorldSaveObject" reading off a
+	 * row widget carries the row's class on its Target pin, so retiring that class leaves the node
+	 * demanding the dead type from a caller that now supplies the new one. Only variables that exist
+	 * on NewClass are moved; the rest are reported in `skipped`.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "FableKit")
+	static FString RetargetVariableRefs(const FString& BlueprintPath, const FString& OldClassPath, const FString& NewClassPath);
+
+	/**
+	 * Change an existing user-defined pin's type on a custom event / function entry / function result.
+	 *
+	 * The counterpart to SetVariableType for a PARAMETER. Every caller node of the event is
+	 * reconstructed afterwards so their argument pins pick the new type up, which is the step that is
+	 * easy to forget and leaves the graph looking correct while refusing to compile.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "FableKit")
+	static FString SetUserPinType(const FString& BlueprintPath, const FString& GraphName, const FString& NodeId, const FString& PinName, const FString& Type);
 
 	/** Re-apply editability/category/replication flags on an existing BP variable. */
 	UFUNCTION(BlueprintCallable, Category = "FableKit")
