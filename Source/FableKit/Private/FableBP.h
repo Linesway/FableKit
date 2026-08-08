@@ -170,6 +170,21 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "FableKit")
 	static FString BreakAllPinLinks(const FString& BlueprintPath, const FString& GraphName, const FString& NodeId, const FString& PinName);
 
+	/** Bind a 'Use cached pose' node to a 'Save cached pose' node.
+	 *
+	 *  Why this needs to exist: an anim POSE output feeds exactly one input, so forking a pose (which
+	 *  is what an upper-body LayeredBoneBlend branch requires) needs a SaveCachedPose/UseCachedPose
+	 *  pair. But the link is UAnimGraphNode_UseCachedPose::SaveCachedPoseNode — a bare UPROPERTY with
+	 *  no EditAnywhere — so PropertyAccessUtil::CanSetPropertyValue refuses it and Python reports
+	 *  "Failed to find property 'save_cached_pose_node'". It IS public C++, so this sets it directly,
+	 *  and also stamps the private NameOfCache via reflection because EarlyValidation re-resolves the
+	 *  pointer from that name at compile time (AnimGraphNode_UseCachedPose.cpp:47-68).
+	 *
+	 *  Both ids must be in the same graph. Reconstructs the Use node so its title/pins refresh. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Graph")
+	static FString LinkCachedPose(const FString& BlueprintPath, const FString& GraphName,
+	                              const FString& UseNodeId, const FString& SaveNodeId);
+
 	/** Widget Blueprints only: remove FDelegateEditorBinding entries whose bound function/property no
 	    longer exists (orphaned property bindings — the UMG compiler hard-errors on them and python can't
 	    reach the protected Bindings array). Returns {ok, removed, kept}. */

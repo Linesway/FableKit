@@ -29,6 +29,11 @@ public class FableKit : ModuleRules
 			// AddEmitterToSystem / KillSystemInstances / the system factory.
 			"Niagara",
 			"NiagaraEditor",
+			// Anim graph authoring (LinkCachedPose): UAnimGraphNode_UseCachedPose /
+			// UAnimGraphNode_SaveCachedPose live here. Needed because the Use node's link to its Save
+			// node is a bare UPROPERTY with no editor binding, so Python cannot set it — see
+			// UFableBP::LinkCachedPose.
+			"AnimGraph",
 		});
 	}
 }

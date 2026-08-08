@@ -57,6 +57,11 @@
 #include "Components/ContentWidget.h"
 #include "Components/PanelSlot.h"
 
+// Anim graph authoring (LinkCachedPose): the Use node's link to its Save node is a bare UPROPERTY
+// with no editor binding, so it can only be set from C++ — see UFableBP::LinkCachedPose.
+#include "AnimGraphNode_UseCachedPose.h"
+#include "AnimGraphNode_SaveCachedPose.h"
+
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "Kismet2/CompilerResultsLog.h"
@@ -1619,6 +1624,51 @@ FString UFableBP::BreakAllPinLinks(const FString& BlueprintPath, const FString& 
 
 	FJObj O = NewObj();
 	O->SetBoolField(TEXT("ok"), true);
+	return ToJson(O);
+}
+
+FString UFableBP::LinkCachedPose(const FString& BlueprintPath, const FString& GraphName,
+	const FString& UseNodeId, const FString& SaveNodeId)
+{
+	FGraphCtx Ctx = GetGraphCtx(BlueprintPath, GraphName, true);
+	if (!Ctx.IsValid()) { return Ctx.Error; }
+
+	FString E;
+	UEdGraphNode* UseRaw = FindNode(Ctx.Graph, UseNodeId, E);   if (!UseRaw) { return E; }
+	UEdGraphNode* SaveRaw = FindNode(Ctx.Graph, SaveNodeId, E); if (!SaveRaw) { return E; }
+
+	UAnimGraphNode_UseCachedPose* UseNode = Cast<UAnimGraphNode_UseCachedPose>(UseRaw);
+	UAnimGraphNode_SaveCachedPose* SaveNode = Cast<UAnimGraphNode_SaveCachedPose>(SaveRaw);
+	if (!UseNode)  { return Err(FString::Printf(TEXT("node %s is a %s, not a UseCachedPose"), *UseNodeId, *UseRaw->GetClass()->GetName())); }
+	if (!SaveNode) { return Err(FString::Printf(TEXT("node %s is a %s, not a SaveCachedPose"), *SaveNodeId, *SaveRaw->GetClass()->GetName())); }
+	if (SaveNode->CacheName.IsEmpty())
+	{
+		return Err(TEXT("the SaveCachedPose node has an empty CacheName — set it first, or the Use node "
+		                "cannot be re-resolved at compile time"));
+	}
+
+	const FScopedTransaction Txn(FText::FromString(TEXT("FableKit: Link Cached Pose")));
+	UseNode->Modify();
+	UseNode->SaveCachedPoseNode = SaveNode;
+
+	/* NameOfCache is private, and it is what EarlyValidation uses to rebuild the weak pointer if it
+	 * ever goes stale (AnimGraphNode_UseCachedPose.cpp:47-68) — so write it too. Reflection ignores
+	 * C++ access specifiers, which is the only reason this is reachable from outside the class. */
+	if (const FProperty* NameProp = UAnimGraphNode_UseCachedPose::StaticClass()->FindPropertyByName(TEXT("NameOfCache")))
+	{
+		if (const FStrProperty* StrProp = CastField<FStrProperty>(NameProp))
+		{
+			StrProp->SetPropertyValue_InContainer(UseNode, SaveNode->CacheName);
+		}
+	}
+
+	UseNode->ReconstructNode();
+	FBlueprintEditorUtils::MarkBlueprintAsModified(Ctx.BP);
+
+	FJObj O = NewObj();
+	O->SetBoolField(TEXT("ok"), true);
+	O->SetStringField(TEXT("cache"), SaveNode->CacheName);
+	O->SetStringField(TEXT("title"), UseNode->GetNodeTitle(ENodeTitleType::ListView).ToString());
 	return ToJson(O);
 }
 
