@@ -34,6 +34,15 @@ public class FableKit : ModuleRules
 			// node is a bare UPROPERTY with no editor binding, so Python cannot set it — see
 			// UFableBP::LinkCachedPose.
 			"AnimGraph",
+			// Gameplay driving (UFablePlay): InjectInputForAction on the player's
+			// UEnhancedInputLocalPlayerSubsystem. This is the whole reason testing does not need
+			// synthetic OS mouse/keyboard — it feeds one player's input subsystem directly, so it
+			// cannot steal window focus or land a click in the wrong editor panel.
+			"EnhancedInput",
+			// FAnimNode_Slot::StaticStruct, for the "does the anim graph actually HAVE this slot"
+			// test in MontageState. A montage on a slot the graph lacks plays silently with no
+			// visible pose, and that is invisible from every other vantage point.
+			"AnimGraphRuntime",
 		});
 	}
 }
