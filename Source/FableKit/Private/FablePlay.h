@@ -47,6 +47,18 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
 	static FString Status();
 
+	/** Start a PIE session on the currently loaded level — the same request the toolbar Play
+	 *  button issues, no OS input, no window focus. The bridge's answer to "test it yourself"
+	 *  (user's standing order, 08-10). Async: PIE spins up over the next frames; poll Status().
+	 *  {ok, alreadyRunning}. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
+	static FString StartPIE();
+
+	/** End the running PIE session (no-op when none). ALWAYS call when a test lane finishes —
+	 *  an abandoned PIE wedges every later editor-scripting call. {ok, wasRunning}. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
+	static FString StopPIE();
+
 	// ---------- input ----------
 
 	/** Every UInputAction asset in the project, plus which mapping contexts the given player has

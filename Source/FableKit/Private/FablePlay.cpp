@@ -9,6 +9,8 @@
 #include "Components/SkeletalMeshComponent.h"
 #include "Containers/Ticker.h"
 #include "Editor.h"
+#include "UnrealEdGlobals.h"                  // GUnrealEd — StartPIE/StopPIE
+#include "Editor/UnrealEdEngine.h"
 #include "EnhancedInputSubsystems.h"
 #include "EnhancedInputComponent.h"
 #include "Engine/Engine.h"
@@ -292,6 +294,33 @@ namespace FablePlayInternal
 }
 
 using namespace FablePlayInternal;
+
+FString UFablePlay::StartPIE()
+{
+	if (!GUnrealEd)
+	{
+		return TEXT("{\"ok\":false,\"error\":\"no GUnrealEd — not an editor build\"}");
+	}
+	if (GEditor && GEditor->PlayWorld)
+	{
+		return TEXT("{\"ok\":true,\"alreadyRunning\":true}");
+	}
+	// Default params = the toolbar Play button's request (selected viewport, in-process).
+	FRequestPlaySessionParams Params;
+	GUnrealEd->RequestPlaySession(Params);
+	return TEXT("{\"ok\":true,\"alreadyRunning\":false}");
+}
+
+FString UFablePlay::StopPIE()
+{
+	const bool bWasRunning = GEditor && GEditor->PlayWorld != nullptr;
+	if (GUnrealEd)
+	{
+		GUnrealEd->RequestEndPlayMap();
+	}
+	return FString::Printf(TEXT("{\"ok\":true,\"wasRunning\":%s}"),
+		bWasRunning ? TEXT("true") : TEXT("false"));
+}
 
 FString UFablePlay::Status()
 {
