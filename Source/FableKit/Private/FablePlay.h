@@ -146,4 +146,43 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
 	static FString SpawnActor(const FString& ClassPath, float X, float Y, float Z,
 		bool bRelativeToPlayer = true, int32 PlayerIndex = 0);
+
+	// ---------- pointer (Slate-level — real UI clicks without touching the machine) ----------
+	/* CallFunction can drive a slot's HANDLER, but it cannot drive the PIPELINE: Slate's press
+	 * routing, the platform's double-click synthesis, the press-claim/release pairing and the
+	 * viewport → Enhanced Input fallback all sit ABOVE the handler — and the 08-10 fast-click bug
+	 * lived entirely in that interplay, invisible to a synthetic handler call. These inject
+	 * pointer events into FSlateApplication itself: everything below the OS runs exactly as for a
+	 * physical mouse, and nothing here moves the machine's cursor or steals focus (the ban on
+	 * driving the WINDOW stands untouched — this drives the APPLICATION). */
+
+	/** Live widgets (PIE world only) whose NAME or CLASS contains Pattern: name, class, and the
+	 *  absolute desktop-space rect PointerClick wants. Index >= 0 narrows to one match;
+	 *  -1 lists up to 40. Zero-size rects are widgets not currently on screen. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
+	static FString WidgetRect(const FString& Pattern, int32 Index = -1);
+
+	/** One full mouse CLICK (move + press + release) at desktop-space coords. bDouble delivers the
+	 *  press as the platform DOUBLE-CLICK event — what the OS turns the second press of a fast
+	 *  pair into, and therefore the half of a rapid click a handler call can never reproduce. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
+	static FString PointerClick(float X, float Y, bool bRight = false, bool bDouble = false);
+
+	/** Hammer: Count clicks at ClicksPerSecond on the game-thread ticker, with the platform's
+	 *  double-click synthesis reproduced faithfully — any press within the double-click time of
+	 *  the previous press at the same spot goes out as a DoubleClick event, exactly like a
+	 *  hammering human. Returns immediately; assert state between PollWatch-style reads. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
+	static FString PointerHammer(float X, float Y, int32 Count = 6, float ClicksPerSecond = 8.0f,
+		bool bRight = false);
+
+	/** Move the Slate pointer (drives hover enter/leave chains — tooltips, hover cues). */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
+	static FString PointerMove(float X, float Y);
+
+	/** The full Slate hit-test path under desktop coords, TOP-MOST FIRST: widget type, debug name
+	 *  and per-widget visibility. When clicks at a point vanish, the widget eating them is on this
+	 *  list — no theory required. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
+	static FString HitTest(float X, float Y);
 };

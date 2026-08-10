@@ -25,6 +25,11 @@
 #include "InputMappingContext.h"
 #include "Kismet/GameplayStatics.h"
 #include "UObject/UnrealType.h"
+#include "UObject/UObjectIterator.h"              // TObjectIterator — WidgetRect's live-widget scan
+#include "Components/Widget.h"                    // UWidget geometry for WidgetRect
+#include "Framework/Application/SlateApplication.h" // pointer injection — the Slate-level click driver
+#include "InputCoreTypes.h"                       // EKeys for the injected pointer events
+#include "Layout/WidgetPath.h"                    // FWidgetPath — the HitTest probe
 
 namespace FablePlayInternal
 {
@@ -862,4 +867,223 @@ FString UFablePlay::SpawnActor(const FString& ClassPath, float X, float Y, float
 	}
 	return FString::Printf(TEXT("{\"ok\":true,\"name\":\"%s\",\"loc\":%s}"),
 		*EscapeJson(Spawned->GetName()), *VecJson(Spawned->GetActorLocation()));
+}
+
+/* ==================================================================================================
+ * Pointer (Slate-level) — see the header block. Everything below the OS runs exactly as for a
+ * physical mouse; nothing here moves the machine's cursor.
+ * ================================================================================================== */
+
+namespace FablePlayInternal
+{
+	FPointerEvent MakePointer(const FVector2D& Pos, const FKey& Button, bool bButtonDown)
+	{
+		TSet<FKey> Pressed;
+		if (bButtonDown)
+		{
+			Pressed.Add(Button);
+		}
+		return FPointerEvent(/*PointerIndex=*/0, Pos, Pos, Pressed, Button,
+			/*WheelDelta=*/0.0f, FModifierKeysState());
+	}
+
+	/** Move + press(+double) + release at desktop coords, through FSlateApplication's own entry
+	 *  points — the exact calls the platform layer makes for a physical mouse. */
+	bool InjectClick(const FVector2D& Pos, bool bRight, bool bDouble)
+	{
+		if (!FSlateApplication::IsInitialized())
+		{
+			return false;
+		}
+		FSlateApplication& App = FSlateApplication::Get();
+		const FKey Button = bRight ? EKeys::RightMouseButton : EKeys::LeftMouseButton;
+
+		// Move first so hover/hit-test state matches a real approach (enter chains, tooltips).
+		App.ProcessMouseMoveEvent(MakePointer(Pos, EKeys::Invalid, false));
+		if (bDouble)
+		{
+			App.ProcessMouseButtonDoubleClickEvent(nullptr, MakePointer(Pos, Button, true));
+		}
+		else
+		{
+			App.ProcessMouseButtonDownEvent(nullptr, MakePointer(Pos, Button, true));
+		}
+		App.ProcessMouseButtonUpEvent(MakePointer(Pos, Button, false));
+		return true;
+	}
+
+	/** The hammer's state — one at a time, like the input holds. */
+	struct FHammer
+	{
+		FVector2D Pos = FVector2D::ZeroVector;
+		int32 Remaining = 0;
+		double Interval = 0.12;
+		double NextClick = 0.0;
+		double LastPress = -1000.0;
+		bool bRight = false;
+		FTSTicker::FDelegateHandle Ticker;
+	};
+	static TSharedPtr<FHammer> GHammer;
+}
+
+FString UFablePlay::WidgetRect(const FString& Pattern, int32 Index)
+{
+	using namespace FablePlayInternal;
+	UWorld* const W = PIEWorld();
+	if (!W)
+	{
+		return Fail(TEXT("no PIE session"));
+	}
+	FString Rows;
+	int32 Matches = 0;
+	for (TObjectIterator<UWidget> It; *It; ++It)
+	{
+		UWidget* const Widget = *It;
+		if (!IsValid(Widget) || Widget->GetWorld() != W)
+		{
+			continue;
+		}
+		const FString Name = Widget->GetName();
+		const FString ClassName = Widget->GetClass()->GetName();
+		if (!Pattern.IsEmpty() && !Name.Contains(Pattern) && !ClassName.Contains(Pattern))
+		{
+			continue;
+		}
+		const FGeometry Geo = Widget->GetCachedGeometry();
+		const FVector2D Size = Geo.GetAbsoluteSize();
+		if (Index >= 0 && Matches != Index)
+		{
+			++Matches;
+			continue;
+		}
+		const FVector2D TopLeft = Geo.GetAbsolutePosition();
+		Rows += FString::Printf(TEXT("%s{\"name\":\"%s\",\"class\":\"%s\",\"x\":%.0f,\"y\":%.0f,\"w\":%.0f,\"h\":%.0f,\"cx\":%.0f,\"cy\":%.0f}"),
+			Rows.IsEmpty() ? TEXT("") : TEXT(","),
+			*EscapeJson(Name), *EscapeJson(ClassName),
+			TopLeft.X, TopLeft.Y, Size.X, Size.Y,
+			TopLeft.X + Size.X * 0.5f, TopLeft.Y + Size.Y * 0.5f);
+		++Matches;
+		if (Index >= 0 || Matches >= 40)
+		{
+			break;
+		}
+	}
+	return FString::Printf(TEXT("{\"ok\":true,\"matches\":%d,\"widgets\":[%s]}"), Matches, *Rows);
+}
+
+FString UFablePlay::PointerClick(float X, float Y, bool bRight, bool bDouble)
+{
+	using namespace FablePlayInternal;
+	if (!PIEWorld())
+	{
+		return Fail(TEXT("no PIE session"));
+	}
+	if (!InjectClick(FVector2D(X, Y), bRight, bDouble))
+	{
+		return Fail(TEXT("Slate not initialized"));
+	}
+	return FString::Printf(TEXT("{\"ok\":true,\"x\":%.0f,\"y\":%.0f,\"right\":%s,\"double\":%s}"),
+		X, Y, bRight ? TEXT("true") : TEXT("false"), bDouble ? TEXT("true") : TEXT("false"));
+}
+
+FString UFablePlay::PointerHammer(float X, float Y, int32 Count, float ClicksPerSecond, bool bRight)
+{
+	using namespace FablePlayInternal;
+	if (!PIEWorld())
+	{
+		return Fail(TEXT("no PIE session"));
+	}
+	if (Count <= 0 || ClicksPerSecond <= 0.0f)
+	{
+		return Fail(TEXT("Count and ClicksPerSecond must be positive"));
+	}
+	if (GHammer.IsValid() && GHammer->Ticker.IsValid())
+	{
+		FTSTicker::GetCoreTicker().RemoveTicker(GHammer->Ticker);   // one hammer at a time
+	}
+
+	TSharedPtr<FHammer> Hammer = MakeShared<FHammer>();
+	Hammer->Pos = FVector2D(X, Y);
+	Hammer->Remaining = Count;
+	Hammer->Interval = 1.0 / static_cast<double>(ClicksPerSecond);
+	Hammer->NextClick = FPlatformTime::Seconds();
+	Hammer->bRight = bRight;
+
+	Hammer->Ticker = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+		[](float) -> bool
+		{
+			if (!GHammer.IsValid() || GHammer->Remaining <= 0 || !PIEWorld())
+			{
+				return false;
+			}
+			FHammer& H = *GHammer;
+			const double Now = FPlatformTime::Seconds();
+			if (Now < H.NextClick)
+			{
+				return true;
+			}
+			H.NextClick = Now + H.Interval;
+
+			/* The platform's own synthesis, reproduced: a press inside the OS double-click window
+			 * of the previous press at the same spot goes out as the DOUBLE-CLICK event — that is
+			 * the event stream a hammering human actually produces, and the half of it a handler
+			 * call can never exercise. 0.5s = the Windows default (Slate itself never sees the OS
+			 * value — the platform layer synthesizes doubles before Slate, which is why there is
+			 * no FSlateApplication getter to ask). */
+			const double DoubleWindow = 0.5;
+			const bool bDouble = (Now - H.LastPress) < DoubleWindow;
+			H.LastPress = Now;
+			InjectClick(H.Pos, H.bRight, bDouble);
+			--H.Remaining;
+			return H.Remaining > 0;
+		}), 0.0f);
+
+	GHammer = Hammer;
+	return FString::Printf(TEXT("{\"ok\":true,\"clicks\":%d,\"cps\":%.1f}"), Count, ClicksPerSecond);
+}
+
+FString UFablePlay::PointerMove(float X, float Y)
+{
+	using namespace FablePlayInternal;
+	if (!PIEWorld())
+	{
+		return Fail(TEXT("no PIE session"));
+	}
+	if (!FSlateApplication::IsInitialized())
+	{
+		return Fail(TEXT("Slate not initialized"));
+	}
+	FSlateApplication::Get().ProcessMouseMoveEvent(MakePointer(FVector2D(X, Y), EKeys::Invalid, false));
+	return FString::Printf(TEXT("{\"ok\":true,\"x\":%.0f,\"y\":%.0f}"), X, Y);
+}
+
+FString UFablePlay::HitTest(float X, float Y)
+{
+	using namespace FablePlayInternal;
+	if (!FSlateApplication::IsInitialized())
+	{
+		return Fail(TEXT("Slate not initialized"));
+	}
+	FSlateApplication& App = FSlateApplication::Get();
+
+	// The same lookup a real press performs: window-under-point, then the bubble path within it.
+	FWidgetPath Path = App.LocateWindowUnderMouse(FVector2D(X, Y), App.GetInteractiveTopLevelWindows(),
+		/*bIgnoreEnabledStatus=*/false);
+	if (!Path.IsValid())
+	{
+		return FString(TEXT("{\"ok\":true,\"widgets\":[]}"));
+	}
+
+	FString Rows;
+	// Deepest widget = the one a press is offered first on the bubble-up — list it FIRST.
+	for (int32 i = Path.Widgets.Num() - 1; i >= 0; --i)
+	{
+		const TSharedRef<SWidget> W = Path.Widgets[i].Widget;
+		Rows += FString::Printf(TEXT("%s{\"type\":\"%s\",\"debug\":\"%s\",\"vis\":\"%s\"}"),
+			Rows.IsEmpty() ? TEXT("") : TEXT(","),
+			*EscapeJson(W->GetTypeAsString()),
+			*EscapeJson(W->ToString()),
+			*EscapeJson(W->GetVisibility().ToString()));
+	}
+	return FString::Printf(TEXT("{\"ok\":true,\"widgets\":[%s]}"), *Rows);
 }

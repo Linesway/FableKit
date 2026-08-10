@@ -43,6 +43,9 @@ public class FableKit : ModuleRules
 			// test in MontageState. A montage on a slot the graph lacks plays silently with no
 			// visible pose, and that is invisible from every other vantage point.
 			"AnimGraphRuntime",
+			// EKeys for the Slate-level pointer injection (UFablePlay::PointerClick/Hammer) —
+			// arrives transitively today, declared so a header shuffle can't quietly break it.
+			"InputCore",
 		});
 	}
 }
