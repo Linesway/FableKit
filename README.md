@@ -154,6 +154,55 @@ transform linearcolor byte wildcard`, `object:/Script/Engine.Actor`, `class:...`
 `struct:/Script/CoreUObject.Vector`, `enum:/Game/...`, `array:<t>`, `set:<t>`,
 `map:<k>|<v>`, suffix `&` = by-ref.
 
+## unreal.FableAnim — animation authoring
+
+Montage slots, root motion, and bulk animation survey. Exists because of two hard Python walls:
+
+- ☠ **`UAnimMontage::SlotAnimTracks` is a bare `UPROPERTY()`** (AnimMontage.h:688) — invisible to
+  `set_editor_property`. So `AnimMontageFactory` montages built from Python are stuck on
+  `DefaultSlot` **forever**, and the slot is what decides whether a montage animates the full body,
+  only the upper body above `spine_03`, or *nothing at all* in the air. A montage on the wrong slot
+  plays silently with no visible pose — indistinguishable from a broken montage.
+- ☠ **`USkeleton::RegisterSlotNode` is C++-only.** A slot name the skeleton has never heard of is
+  not an error anywhere; the montage just does nothing. `SetMontageSlot`/`CreateMontage` register a
+  new name and report `registered_new_slot_on_skeleton` so a typo shows up as a suspicious new
+  one-slot group instead of a silent no-op.
+
+```python
+import unreal, json
+A = unreal.FableAnim
+
+# read: slot, root motion, length, source clips, and who else references it
+json.loads(A.info('/Game/Animation/.../GreatSword_Attack'))
+#   {'slot':'WeaponGrounded','has_root_motion':True,'rate_scale':1.2,
+#    'slot_tracks':[{'slot':...,'segments':[{'anim':...,'anim_root_motion':True}]}], ...}
+
+A.list_skeleton_slots('/Game/Character/ALS_Mannequin_Skeleton')   # every valid slot name, grouped
+A.survey('/Game/Animation', 'slash')      # bulk: name/class/slot/root_motion/length
+A.list_referencers('/Game/Animation/.../greatswordslash_UE')
+
+# author
+A.create_montage(seq_path, '/Game/Anim/M_New', 'WeaponUpperBody', rate_scale)  # create AND slot
+A.set_montage_slot('/Game/Anim/M_New', 'WeaponGrounded')          # move an existing montage
+A.set_montage_timing('/Game/Anim/M_New', rate, blend_in, blend_out)
+A.set_root_motion(seq_path, True)                                  # refuses if others reference it
+A.duplicate_anim(src, dst)                                         # the "copy, then flip" workflow
+```
+
+**`SetRootMotion` refuses a SHARED clip by default.** Root motion lives on the *sequence*, so
+flipping it changes every montage and every weapon that plays it — the reply lists the referencers
+so you can duplicate first. Pass `b_allow_shared=True` when you really mean all of them.
+
+Slot cheat-sheet for the ALS player graph (see the project's `anim-slot-air-truth` notes):
+`WeaponGrounded` = full body but **invisible in the air**; `WeaponUpperBody` = layered from
+spine_03, legs keep locomotion; `WeaponBaseLayer` / `WeaponDefaultSlot` = full body, air-safe.
+☠ Root motion in the air REPLACES horizontal velocity every frame, so never give an air attack a
+root-motion clip.
+
+All mutators refuse during PIE, are transactional (Ctrl+Z), mark the package dirty, and **never
+save** — call `save_asset` / `save_packages` once the result reads right. `CreateMontage` and
+`DuplicateAnim` are **create-only** and refuse an existing path.
+
 ## Limits
 
 - The editor must be running (headless alternative:
