@@ -71,8 +71,27 @@ def main():
     ues = unreal.UnrealEditorSubsystem()
 
     # TRAP 1 — the template brings light + sky + floor. new_level() alone renders black.
-    les.new_level_from_template("/Temp/LookHarness", "/Engine/Maps/Templates/Template_Default")
-    note("scratch level from Default template (never saved)")
+    # ☠☠ TRAP 5, and it invalidated a whole verification pass: DO NOT RECREATE THE LEVEL EVERY CALL.
+    # A shot taken in the same call that built the level comes back EMPTY (sky and floor, no
+    # subject) or pure black — the viewport has not settled. Because this script runs once per
+    # subject, rebuilding each time meant every shot was a first-shot. Build it once, then reuse.
+    # ☠ DO NOT identify the level BY NAME — an unsaved /Temp/ level reports as "Untitled", so a
+    # name test never matches and the level is rebuilt on every call, which is the very bug this
+    # guard exists to prevent. Ask a FACT instead: is our marker actor in the world?
+    marker = None
+    for a in eas.get_all_level_actors():
+        if a.get_actor_label() == "LOOK_HARNESS_MARKER":
+            marker = a
+            break
+    if marker is None:
+        les.new_level_from_template("/Temp/LookHarness", "/Engine/Maps/Templates/Template_Default")
+        mk = eas.spawn_actor_from_class(unreal.StaticMeshActor, unreal.Vector(0, 0, -5000),
+                                        unreal.Rotator(0, 0, 0))
+        mk.set_actor_label("LOOK_HARNESS_MARKER")
+        note("scratch level built — CALL AGAIN to shoot (this one will not have settled)")
+        open(OUT, "w", encoding="utf-8").write("\n".join(lines))
+        return
+    note("reusing the warm scratch level")
 
     # ONE subject per call — see TRAP 3. Pick the first whose shot has not been taken.
     shots_dir = unreal.Paths.project_saved_dir() + "Screenshots/WindowsEditor/"
@@ -98,7 +117,8 @@ def main():
             continue
 
         for a in eas.get_all_level_actors():
-            if isinstance(a, unreal.StaticMeshActor) and "Floor" not in a.get_actor_label():
+            lbl = a.get_actor_label()
+            if isinstance(a, unreal.StaticMeshActor) and "Floor" not in lbl and lbl != "LOOK_HARNESS_MARKER":
                 eas.destroy_actor(a)
 
         z = float(s.get("z", 260))
