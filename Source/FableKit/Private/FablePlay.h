@@ -180,6 +180,19 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
 	static FString PointerMove(float X, float Y);
 
+	/* REST the pointer somewhere for Seconds, re-injecting every frame. Returns immediately.
+	 *
+	 * PointerMove sets hover once and the next frame can take it straight back, because the
+	 * platform re-derives the cursor from the real mouse. Anything gated on the cursor having
+	 * STAYED — a hold-to-reveal, a tooltip delay, a hover-cue gate — cannot arm from a single
+	 * move, and the caller cannot hold it by waiting either: a bridge call owns the game thread
+	 * for its duration, so nothing ticks while you sleep inside one.
+	 *
+	 * Drive a hold like this: PointerRest(x, y, 2.0), return, sleep in the SHELL, then read the
+	 * state in a second call while the rest is still running. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
+	static FString PointerRest(float X, float Y, float Seconds = 2.0f);
+
 	/** The full Slate hit-test path under desktop coords, TOP-MOST FIRST: widget type, debug name
 	 *  and per-widget visibility. When clicks at a point vanish, the widget eating them is on this
 	 *  list — no theory required. */

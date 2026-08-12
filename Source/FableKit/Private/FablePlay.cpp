@@ -912,6 +912,15 @@ namespace FablePlayInternal
 		return true;
 	}
 
+	/** The pointer-rest's state. One at a time, like the hammer and the input holds. */
+	struct FRest
+	{
+		FVector2D Pos = FVector2D::ZeroVector;
+		double Until = 0.0;
+		FTSTicker::FDelegateHandle Ticker;
+	};
+	static TSharedPtr<FRest> GRest;
+
 	/** The hammer's state — one at a time, like the input holds. */
 	struct FHammer
 	{
@@ -936,7 +945,12 @@ FString UFablePlay::WidgetRect(const FString& Pattern, int32 Index)
 	}
 	FString Rows;
 	int32 Matches = 0;
-	for (TObjectIterator<UWidget> It; *It; ++It)
+	/* ☠ `It`, NOT `*It`. TObjectIterator's operator* INDEXES the global object array, so using it as
+	 * the loop condition dereferences one past the end on the final step and takes the whole editor
+	 * down with `Array index out of bounds: 9280 into an array of size 9280`. The bool conversion is
+	 * the only safe test. This crashed the editor on the first call that reached the end of the
+	 * iteration — i.e. every call whose Pattern did not match something early. */
+	for (TObjectIterator<UWidget> It; It; ++It)
 	{
 		UWidget* const Widget = *It;
 		if (!IsValid(Widget) || Widget->GetWorld() != W)
@@ -1055,6 +1069,63 @@ FString UFablePlay::PointerMove(float X, float Y)
 	}
 	FSlateApplication::Get().ProcessMouseMoveEvent(MakePointer(FVector2D(X, Y), EKeys::Invalid, false));
 	return FString::Printf(TEXT("{\"ok\":true,\"x\":%.0f,\"y\":%.0f}"), X, Y);
+}
+
+FString UFablePlay::PointerRest(float X, float Y, float Seconds)
+{
+	using namespace FablePlayInternal;
+	if (!PIEWorld())
+	{
+		return Fail(TEXT("no PIE session"));
+	}
+	if (!FSlateApplication::IsInitialized())
+	{
+		return Fail(TEXT("Slate not initialized"));
+	}
+	if (Seconds <= 0.0f)
+	{
+		return Fail(TEXT("Seconds must be positive"));
+	}
+	if (GRest.IsValid() && GRest->Ticker.IsValid())
+	{
+		FTSTicker::GetCoreTicker().RemoveTicker(GRest->Ticker);   // one rest at a time
+	}
+
+	TSharedPtr<FRest> Rest = MakeShared<FRest>();
+	Rest->Pos = FVector2D(X, Y);
+	Rest->Until = FPlatformTime::Seconds() + static_cast<double>(Seconds);
+
+	/* RE-INJECT EVERY FRAME, and that is the whole point of this over PointerMove.
+	 *
+	 * A single move sets Slate's hover and then the next frame can take it straight back: the
+	 * platform layer re-derives the cursor from the REAL mouse, which is wherever the human left
+	 * it. Anything that asks "has the cursor RESTED here" — a hold-to-reveal, a tooltip delay, a
+	 * hover cue gate — therefore never arms from one move, and the caller cannot hold it either,
+	 * because a call through the Remote Control bridge OWNS THE GAME THREAD for its duration and
+	 * the game cannot tick while you wait inside one.
+	 *
+	 * So the rest lives on the ticker instead: the pointer is put back every frame for Seconds,
+	 * the game ticks normally throughout, and the caller returns immediately and reads the result
+	 * in a LATER call. */
+	Rest->Ticker = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+		[](float) -> bool
+		{
+			if (!GRest.IsValid() || !PIEWorld() || !FSlateApplication::IsInitialized())
+			{
+				return false;
+			}
+			if (FPlatformTime::Seconds() >= GRest->Until)
+			{
+				return false;   // let go; the next real mouse move owns the cursor again
+			}
+			FSlateApplication::Get().ProcessMouseMoveEvent(
+				MakePointer(GRest->Pos, EKeys::Invalid, false));
+			return true;
+		}), 0.0f);
+
+	GRest = Rest;
+	return FString::Printf(TEXT("{\"ok\":true,\"x\":%.0f,\"y\":%.0f,\"seconds\":%.2f}"),
+		X, Y, Seconds);
 }
 
 FString UFablePlay::HitTest(float X, float Y)
