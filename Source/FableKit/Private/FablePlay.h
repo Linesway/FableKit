@@ -14,10 +14,29 @@
  * Content Browser instead of the viewport, and raised a "Delete Assets" modal — which blocks the
  * game thread and wedges this very bridge — while the user was at the machine doing something else.
  *
- * The ban was never on driving the GAME. It was on driving the WINDOW. Enhanced Input already ships
- * the right primitive: InjectInputForAction feeds a specific player's input subsystem directly, so
- * it cannot steal focus, cannot land in the wrong panel, and still runs the real bindings, the real
- * triggers and the real gameplay code. Everything here is built on that.
+ * The ban was never on driving the GAME. It was on driving the WINDOW.
+ *
+ * ☠ THE RULE, AND IT IS NOT NEGOTIABLE: NOTHING IN THIS FILE MAY EVER CALL SetCursorPos, mouse_event,
+ * SendKeys, SendInput OR SetForegroundWindow. Every entry point here enters INSIDE THE PROCESS, at
+ * FSlateApplication (pointer / character events) or APlayerController::InputKey (keys, axes) — the
+ * exact two doors the platform layer itself knocks on. Nothing moves the machine's cursor, nothing
+ * steals focus, nothing can land in the wrong editor panel. If a later change "improves" any of this
+ * into synthetic OS input, it re-buys a bug that has already been paid for once.
+ *
+ * ============================================================================================
+ * ☠ AND THE ONE THAT COST 08-09 THROUGH 08-13: InjectInputForAction IS A SIDE CHANNEL.
+ *
+ * InjectAction / HoldAction / ReleaseAction below report ok:true and, for this project, do nothing.
+ * Enhanced Input stamps an injected value for exactly one frame, consumes it only if a CURRENTLY
+ * APPLIED mapping context maps that action, and — the fatal part — it never touches the key-state
+ * table (UPlayerInput::KeyStateMap) that every trigger is actually evaluated against. So the value
+ * lands somewhere nobody reads, and every symptom of that is silence.
+ *
+ * PressKey / ReleaseKey / TapKey / HoldKey / MouseAxis / GamepadAxis go in the OTHER door:
+ * APlayerController::InputKey -> UPlayerInput::InputKey -> KeyStateMap -> ProcessInputStack. That is
+ * the same call the viewport makes when a physical keyboard reports a key, so Enhanced Input cannot
+ * tell the harness from hardware — there is no difference left to tell. Prefer them. InjectAction is
+ * kept only as a fallback for an action no key maps at all.
  * ============================================================================================
  *
  * Conventions match UFableBP: every function returns a JSON string, mutators answer {"ok":true,...}
@@ -59,14 +78,84 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
 	static FString StopPIE();
 
-	// ---------- input ----------
+	// ---------- input: KEYS (the real door — prefer these over InjectAction) ----------
+	/* Everything in this block ends up at APlayerController::InputKey, which is where the viewport
+	 * delivers a physical keystroke. Key names are FKey names ("W", "SpaceBar", "LeftMouseButton",
+	 * "Gamepad_FaceButton_Bottom"), with the obvious aliases accepted: lmb/rmb/mmb, space, esc,
+	 * ctrl/shift/alt (left variants), enter. ListKeys() greps the whole table if you are unsure. */
 
-	/** Every UInputAction asset in the project, plus which mapping contexts the given player has
-	 *  active. Use this instead of guessing an action path. */
+	/** One IE_Pressed. The key STAYS DOWN — UPlayerInput maintains bDown until a release — so this is
+	 *  a real hold, not a one-frame stamp. ☠ Always pair it with ReleaseKey (or use HoldKey/TapKey);
+	 *  a key left down survives PIE restarts within the session and poisons every later test. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
+	static FString PressKey(const FString& Key, int32 PlayerIndex = 0);
+
+	/** One IE_Released. Safe to call on a key that is not down. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
+	static FString ReleaseKey(const FString& Key, int32 PlayerIndex = 0);
+
+	/** Press now, release on the NEXT tick. A Pressed trigger needs the transition, not the level, so
+	 *  this — not a one-frame value — is what "tap Jump" actually means. Returns immediately. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
+	static FString TapKey(const FString& Key, int32 PlayerIndex = 0);
+
+	/** Hold for Seconds on the game-thread ticker, re-arming every frame (IE_Repeat for a digital key,
+	 *  the analog value for an axis), and END WITH A REAL IE_Released — not a starved frame. Returns
+	 *  immediately; the game ticks throughout. Holding the same key again replaces the running hold. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
+	static FString HoldKey(const FString& Key, float Seconds = 1.0f, float Amount = 1.0f, int32 PlayerIndex = 0);
+
+	/** End every hold this harness started with a real release (and zero every analog axis it moved).
+	 *  bFlushAll additionally calls APlayerController::FlushPressedKeys, which releases keys nobody
+	 *  here pressed. Call this at the end of a lane the way you close PIE. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
+	static FString ReleaseAllKeys(bool bFlushAll = false, int32 PlayerIndex = 0);
+
+	/** Mouse LOOK: a delta on EKeys::MouseX / MouseY, which is what a mouse actually reports. No
+	 *  current call can turn the camera. These axes carry UpdateAxisWithoutSamples, so the delta
+	 *  self-clears next frame exactly as a real mouse's does — call it repeatedly to keep turning. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
+	static FString MouseAxis(float DX, float DY, int32 PlayerIndex = 0);
+
+	/** Analog stick / trigger via AmountDepressed — the only way the Steam Deck layout is testable at
+	 *  all (the pad is five bindings today and nothing could drive it).
+	 *
+	 *  ☠ A GAMEPAD AXIS DOES NOT SELF-CLEAR. Unlike MouseX/Y it has no UpdateAxisWithoutSamples flag,
+	 *  so a value written once stays deflected FOREVER — a stuck stick that looks like an AI bug. This
+	 *  therefore always cleans up after itself: Seconds <= 0 zeroes the axis on the next tick, and
+	 *  Seconds > 0 holds it on the ticker and then zeroes it. Pass Seconds for anything real. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
+	static FString GamepadAxis(const FString& Key, float Amount = 1.0f, float Seconds = 0.0f,
+		int32 PlayerIndex = 0);
+
+	/** Every FKey whose name or display name contains Pattern (empty = the lot, capped at 200).
+	 *  Reports analog/gamepad/mouse flags, so "which name does the Deck's left stick have" is a call
+	 *  rather than a guess. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
+	static FString ListKeys(const FString& Pattern = TEXT(""));
+
+	/** What the ENGINE believes about a key right now: down, time held, analog value. This is the
+	 *  mutation test for everything above — press, read it down, release, read it up. If PressKey
+	 *  ever silently stops working the way InjectAction did, this is the call that says so. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
+	static FString KeyState(const FString& Key, int32 PlayerIndex = 0);
+
+	/** What Enhanced Input believes about an ACTION right now: bound keys, current trigger event,
+	 *  value, elapsed/triggered time. The other half of the proof — KeyState says the key arrived,
+	 *  this says the action fired. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
+	static FString ActionState(const FString& ActionPath, int32 PlayerIndex = 0);
+
+	// ---------- input: actions (fallback) ----------
+
+	/** Every UInputAction asset in the project — and, for the given player, WHETHER EACH ONE IS
+	 *  ACTUALLY BOUND by a currently applied mapping context, plus the keys that bind it and the list
+	 *  of applied contexts. An unbound action is one nothing can drive: injecting it does nothing and
+	 *  reports nothing, which is precisely the failure that went undiagnosed from 08-09. */
 	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
 	static FString ListInputActions(int32 PlayerIndex = 0);
 
-	/** Inject ONE FRAME of an action. Axis actions take X/Y/Z; a button wants X=1.
+	/** ⛔ FALLBACK ONLY — see the header block. Inject ONE FRAME of an action. Axis actions take X/Y/Z; a button wants X=1.
 	 *  A single frame is a TAP for a Pressed trigger — for anything that measures how long you held
 	 *  the button (a charge, a launcher follow), use HoldAction: an injection lasts exactly one
 	 *  frame and Enhanced Input sees a release on the next one. */
@@ -198,4 +287,78 @@ public:
 	 *  list — no theory required. */
 	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
 	static FString HitTest(float X, float Y);
+
+	/** Press at (X1,Y1), travel to (X2,Y2) over Seconds in Steps moves with the button HELD, release.
+	 *  The intermediate moves are the point: Slate only raises OnDragDetected once the pointer has
+	 *  moved the drag-trigger distance WHILE down, so a press+release pair — or a single teleporting
+	 *  move — can never start a drag. INVENTORY DRAG-DROP HAS NEVER BEEN MACHINE-TESTED; this is the
+	 *  call that tests it. Runs on the ticker, returns immediately, PollSequence-free (poll widgets). */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
+	static FString Drag(float X1, float Y1, float X2, float Y2, float Seconds = 0.35f,
+		int32 Steps = 12, bool bRight = false);
+
+	/** Mouse wheel at desktop coords (negative X/Y = wherever the Slate pointer already is). Drives
+	 *  hotbar cycling, map zoom and the weapon-mode wheel. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
+	static FString ScrollWheel(float Delta, float X = -1.0f, float Y = -1.0f);
+
+	/** Type a string into whatever Slate widget holds keyboard focus: per character, a key down, the
+	 *  character event, and a key up — the three events a real keystroke produces, in that order.
+	 *  CharsPerSecond <= 0 sends the whole string this frame; otherwise it types on the ticker and
+	 *  returns immediately (a text box that debounces per keystroke needs the real cadence). */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
+	static FString TypeText(const FString& Text, float CharsPerSecond = 0.0f);
+
+	// ---------- sequences ----------
+
+	/** ☠☠ A BRIDGE CALL OWNS THE GAME THREAD, so a multi-step playthrough CANNOT be one script with
+	 *  sleeps in it — nothing ticks while you wait. This runs the whole script on the game-thread
+	 *  ticker and returns at once; PollSequence() reads the transcript afterwards.
+	 *
+	 *  Steps are separated by '|'. Everything is case-insensitive.
+	 *      W 2.0              hold key W for 2 s        (a bare number after a key = hold seconds)
+	 *      W                  tap W                     (equivalently "W TAP")
+	 *      LMB DOWN / LMB UP  press / release, unpaired
+	 *      LOOK 90 0          mouse delta dx dy         (also "MOUSE")
+	 *      AXIS Gamepad_LeftX -1.0 1.5   analog axis, amount then seconds
+	 *      WAIT 0.5           do nothing for 0.5 s
+	 *      CLICK 640 360      Slate click  (CLICK R x y for right, DCLICK for double)
+	 *      MOVE 640 360       Slate pointer move
+	 *      SCROLL -2          mouse wheel
+	 *      TYPE hello there   type the rest of the step as text
+	 *      CALL player Func A B    CallFunction on a target — the reliable driver, inline
+	 *      SAY anything       write a marker into the transcript
+	 *
+	 *  "W 2.0 | LOOK 90 0 | LMB TAP | WAIT 0.5 | E TAP" is one bridge call and one playthrough beat.
+	 *  ☠ The runner releases every key it pressed when it ends, aborts, or is replaced. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
+	static FString RunSequence(const FString& Script, int32 PlayerIndex = 0);
+
+	/** {ok, running, step, total, elapsed, transcript:[{t, step, result}]}. Drains the transcript, so
+	 *  repeated polls stream rather than repeat — the same contract as PollWatch. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
+	static FString PollSequence();
+
+	/** Abort the running sequence NOW, releasing anything it was holding. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
+	static FString StopSequence();
+
+	// ---------- capture ----------
+
+	/** A PNG of what the player is looking at, WITH THE EDITOR BACKGROUNDED OR MINIMISED.
+	 *
+	 *  ☠ take_high_res_screenshot cannot do this twice over: it needs the editor window foregrounded,
+	 *  which is the one thing the input ban forbids, AND it photographs the scene without compositing
+	 *  UMG — so no widget can ever be judged from one. This renders instead of photographing: a
+	 *  USceneCaptureComponent2D placed at the player camera draws the world into a render target (no
+	 *  window, no focus, no swap chain involved), and then — when bIncludeUI — the game's live Slate
+	 *  overlay is drawn ON TOP of that same target with the clear disabled, so the HUD composites in
+	 *  for free with no pixel readback.
+	 *
+	 *  FOV <= 0 takes the player camera's own. OutPngPath may be absolute or relative to the project.
+	 *  Returns {ok, png, width, height, bytes, ui} — ☠ judge it by BYTES, not by ok: an unwritable
+	 *  path leaves a successful capture with nothing on disk. */
+	UFUNCTION(BlueprintCallable, Category = "FableKit|Play")
+	static FString CaptureScreen(const FString& OutPngPath, int32 Width = 1280, int32 Height = 720,
+		bool bIncludeUI = true, float FOV = 0.0f, int32 PlayerIndex = 0);
 };

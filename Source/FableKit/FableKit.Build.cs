@@ -46,6 +46,12 @@ public class FableKit : ModuleRules
 			// EKeys for the Slate-level pointer injection (UFablePlay::PointerClick/Hammer) —
 			// arrives transitively today, declared so a header shuffle can't quietly break it.
 			"InputCore",
+			// IPlatformInputDeviceMapper, for UFablePlay::PressKey and friends. ☠ NOT optional
+			// polish: APlayerController::InputKey DROPS an event whose FInputDeviceId does not map
+			// to the controller's platform user (UInputSettings::bFilterInputByPlatformUser), and a
+			// default-constructed device id is INPUTDEVICEID_NONE, which maps to nobody. The whole
+			// real-input route silently does nothing without a device resolved through this.
+			"ApplicationCore",
 		});
 	}
 }
